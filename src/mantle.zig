@@ -1,0 +1,56 @@
+pub const Connection = @import("client/connection.zig").Connection;
+pub const DateTime = @import("client/connection.zig").DateTime;
+pub const Time = @import("client/connection.zig").Time;
+pub const Decimal = @import("protocol/protocol.zig").decimal.Decimal;
+pub const QueryResult = @import("client/connection.zig").QueryResult;
+pub const OkSummary = @import("client/connection.zig").OkSummary;
+pub const ServerError = @import("client/connection.zig").ServerError;
+pub const PreparedStatement = @import("client/statement.zig").PreparedStatement;
+pub const Transaction = @import("client/transaction.zig").Transaction;
+pub const IsolationLevel = @import("client/transaction.zig").IsolationLevel;
+pub const AccessMode = @import("client/transaction.zig").AccessMode;
+pub const TxOptions = @import("client/transaction.zig").TxOptions;
+pub const Table = @import("client/table.zig").Table;
+pub const column_reader = @import("result/column_reader.zig");
+pub const type_mapper = @import("result/type_mapper.zig");
+pub const ConnectionPhase = @import("session/connection_phase.zig").ConnectionPhase;
+pub const PacketStream = @import("session/packet_stream.zig").PacketStream;
+const pool = @import("pool.zig");
+pub const Pool = pool.Pool;
+pub const PoolConfig = pool.Config;
+pub const PoolStats = pool.Stats;
+pub const TcpDriver = pool.TcpDriver;
+pub const TcpPool = pool.TcpPool;
+pub const PooledConnection = pool.PooledConnection;
+pub const default_statement_cache_capacity = @import("client/statement.zig").default_statement_cache_capacity;
+pub const protocol = @import("protocol/protocol.zig");
+pub const transport = @import("transport.zig");
+pub const Transport = transport.Transport;
+
+test {
+    _ = Connection;
+    _ = Decimal;
+    _ = QueryResult;
+    _ = ConnectionPhase;
+    _ = column_reader;
+    _ = type_mapper;
+    _ = PacketStream;
+    _ = pool;
+    _ = protocol;
+    _ = transport;
+    _ = Transport;
+    _ = @import("result/row.zig");
+    _ = @import("client/table.zig");
+    _ = @import("client/transaction.zig");
+    _ = @import("client/statement.zig");
+    _ = @import("client/connection_test.zig");
+
+    _ = @import("result/column_reader_test.zig");
+    _ = @import("result/decode_adapter_test.zig");
+    _ = @import("result/type_mapper_test.zig");
+    _ = @import("session/connection_phase_test.zig");
+    _ = @import("session/packet_stream_test.zig");
+    _ = @import("client/statement_test.zig");
+    _ = @import("pool_test.zig");
+    _ = @import("transport_test.zig");
+}
