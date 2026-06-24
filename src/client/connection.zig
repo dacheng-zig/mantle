@@ -26,6 +26,16 @@ const freeCacheNode = statement_mod.freeCacheNode;
 pub const OkSummary = mantle.transport.OkSummary;
 pub const ServerError = mantle.transport.ServerError;
 
+/// Scoped logger for mantle's SQL diagnostics — server errors (`.warn`) and
+/// statement tracing (`.debug`), tunable via the `.mantle` log scope.
+const log = std.log.scoped(.mantle);
+
+/// Trace one issued statement. `.debug`, not `.warn`: high-volume hot-path
+/// logging, silent unless the `.mantle` scope opts in.
+fn logSql(sql: []const u8) void {
+    log.debug("sql: {s}", .{sql});
+}
+
 /// Result of a non-streaming command. The `err` variant owns its message;
 /// call `deinit` once done. Use `expectOk` to collapse to an `OkSummary` or a
 /// Zig error.
@@ -273,8 +283,18 @@ pub const Connection = struct {
         }
     }
 
-    /// Take ownership of `err`, replacing any previously captured error.
+    /// Take ownership of `err`, replacing any previously captured one. As the
+    /// sole funnel for swallowed server errors, it also logs them, so callers
+    /// that never read `lastError()` still see the code, SQLSTATE, and message.
     fn captureError(self: *Connection, allocator: std.mem.Allocator, err: ServerError) void {
+        // `.warn`, not `.err`: a server error is an application outcome
+        // (duplicate key, constraint violation, ...), not a driver fault — the
+        // caller decides whether it is fatal.
+        if (err.sql_state) |state| {
+            log.warn("server error {d} ({s}): {s}", .{ err.code, &state, err.message });
+        } else {
+            log.warn("server error {d}: {s}", .{ err.code, err.message });
+        }
         if (self.last_error) |*prev| prev.deinit(allocator);
         self.last_error = err;
     }
@@ -520,6 +540,7 @@ pub const Connection = struct {
         params: anytype,
     ) !Table(T) {
         try self.ensureUsable();
+        logSql(sql);
         var attempts: u8 = 0;
         while (true) {
             const node = try self.cachedStatement(allocator, sql);
@@ -646,6 +667,7 @@ pub const Connection = struct {
         try self.ensureUsable();
         var diagnostic_capture_failed = false;
         errdefer |err| if (!diagnostic_capture_failed) self.classifyError(err);
+        logSql(sql);
         try self.transport.sendCommand(allocator, protocol.command.Command.initQuery(sql));
         var response = try self.transport.readQueryResponse(allocator);
         errdefer response.deinit(allocator);
@@ -668,6 +690,7 @@ pub const Connection = struct {
     ) !TextResult {
         try self.ensureUsable();
         errdefer |err| self.classifyError(err);
+        logSql(sql);
         try self.transport.sendCommand(allocator, protocol.command.Command.initQuery(sql));
         const response = try self.transport.readQueryResponse(allocator);
         switch (response) {
@@ -777,6 +800,7 @@ pub const Connection = struct {
         params: anytype,
     ) !OkSummary {
         try self.ensureUsable();
+        logSql(sql);
         var attempts: u8 = 0;
         while (true) {
             const node = try self.cachedStatement(allocator, sql);
@@ -796,7 +820,11 @@ pub const Connection = struct {
                         attempts += 1;
                         continue;
                     }
-                    self.captureError(allocator, err);
+                    // `executeParams` already captured this into `last_error`
+                    // (via `cloneAndCaptureError`); capturing again would re-log
+                    // the same error. Free the result's copy instead —
+                    // `lastError()` stays valid for the caller.
+                    result.deinit(allocator);
                     self.releaseStatement(allocator, node);
                     return error.ServerError;
                 },
