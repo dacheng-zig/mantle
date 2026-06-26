@@ -62,6 +62,11 @@ pub const ColumnDefinition41 = struct {
     flags: u16,
     decimals: u8,
 
+    /// Parse a borrowed view: every string field (`catalog`, `schema`,
+    /// `table`, `org_table`, `name`, `org_name`) aliases `payload` and is valid
+    /// only while `payload` lives. Do NOT call `deinit` on a parsed instance —
+    /// it would free payload-interior pointers. Call `clone` first to obtain an
+    /// owned, `deinit`-able copy that can outlive the packet buffer.
     pub fn parse(payload: []const u8) protocol.types.Error!ColumnDefinition41 {
         var reader = protocol.PayloadReader.init(payload);
         const catalog = try reader.readLengthEncodedString();
@@ -94,6 +99,9 @@ pub const ColumnDefinition41 = struct {
         };
     }
 
+    /// Deep-copy into an owned instance whose string fields are heap-allocated
+    /// and survive the source `payload`. The returned value MUST be released
+    /// with `deinit`.
     pub fn clone(self: ColumnDefinition41, allocator: std.mem.Allocator) !ColumnDefinition41 {
         const catalog = try allocator.dupe(u8, self.catalog);
         errdefer allocator.free(catalog);
@@ -124,6 +132,9 @@ pub const ColumnDefinition41 = struct {
         };
     }
 
+    /// Free the owned string fields. Valid ONLY on an instance produced by
+    /// `clone`; calling it on a `parse`d (payload-borrowed) instance frees
+    /// pointers into the packet buffer and corrupts the heap.
     pub fn deinit(self: *ColumnDefinition41, allocator: std.mem.Allocator) void {
         allocator.free(self.catalog);
         allocator.free(self.schema);
@@ -170,20 +181,17 @@ pub const ResultPacketTag = enum {
     err,
 
     pub fn classify(payload: []const u8, column_count: usize) protocol.types.Error!ResultPacketTag {
+        // The leading byte fully disambiguates the packet kind: 0xff is ERR,
+        // 0xfe with a short payload is EOF (a length-encoded string can never
+        // start with 0xfe in a row of plausible length), everything else is a
+        // row. We deliberately do NOT walk every column here to validate the
+        // row — `TextRow.parse` does that on the same payload immediately after,
+        // and a full column scan in classify would double the per-column decode
+        // work on the hottest path. The binary path classifies the same way.
+        _ = column_count;
         if (payload.len == 0) return error.EndOfPayload;
         if (payload[0] == 0xff) return .err;
         if (payload[0] == 0xfe and payload.len < 9) return .eof;
-
-        var reader = protocol.PayloadReader.init(payload);
-        for (0..column_count) |_| {
-            if (reader.remaining() == 0) return error.EndOfPayload;
-            if (try reader.peek() == 0xfb) {
-                _ = try reader.readInt(u8);
-            } else {
-                _ = try reader.readLengthEncodedString();
-            }
-        }
-        if (reader.remaining() != 0) return error.MalformedResultSetPacket;
         return .row;
     }
 };

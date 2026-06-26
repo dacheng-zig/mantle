@@ -115,6 +115,23 @@ test "column reader reads binary scalar values" {
     try std.testing.expectEqual(true, (try readBinaryBool(&columns, &values, 3)).?);
 }
 
+test "column reader binary int returns error on overflow instead of panicking" {
+    const columns = [_]protocol.text_result.ColumnDefinition41{
+        testColumn("big", .longlong, 0),
+        testColumn("ubig", .longlong, unsigned_flag),
+    };
+    // 0x0000000100000000 = 4294967296: fits i64/u32-no, too big for i32.
+    const big = [_]u8{ 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00 };
+    // Unsigned u64 with the high bit set does not fit a signed target.
+    const ubig = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+    const values = [_]?[]const u8{ &big, &ubig };
+
+    try std.testing.expectError(error.IntegerOverflow, readBinaryInt(i32, &columns, &values, 0));
+    try std.testing.expectError(error.IntegerOverflow, readBinaryInt(i64, &columns, &values, 1));
+    // The full-width target still decodes correctly.
+    try std.testing.expectEqual(@as(i64, 4294967296), (try readBinaryInt(i64, &columns, &values, 0)).?);
+}
+
 test "column reader reads binary datetime values" {
     const columns = [_]protocol.text_result.ColumnDefinition41{
         testColumn("created", .datetime, 0),

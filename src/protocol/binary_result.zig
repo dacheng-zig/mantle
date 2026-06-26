@@ -73,6 +73,8 @@ fn readValue(
         .json,
         .geometry,
         .bit,
+        .enum_,
+        .set,
         => try reader.readLengthEncodedString(),
         else => error.UnsupportedBinaryColumnType,
     };

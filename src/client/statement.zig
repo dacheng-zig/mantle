@@ -34,6 +34,12 @@ pub const er_need_reprepare: u16 = 1615;
 /// Default per-connection prepared-statement cache capacity. Caching is on by
 /// default so repeated identical SQL skips the `COM_STMT_PREPARE` +
 /// `COM_STMT_CLOSE` round-trips. Set to 0 to disable.
+///
+/// Tuning note: this is per connection, so the server-side handle count scales
+/// as roughly `capacity * pool_size`. With a large pool and many distinct SQL
+/// texts this can approach the server's global `max_prepared_stmt_count`
+/// (default 16382); workloads issuing many unique statements also thrash
+/// prepare/close. Lower the capacity (or disable caching) for such workloads.
 pub const default_statement_cache_capacity: usize = 256;
 
 pub const StatementCacheNode = struct {

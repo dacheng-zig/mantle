@@ -1,6 +1,9 @@
 const std = @import("std");
 
 pub const Decimal = struct {
+    /// The raw decimal text. When produced by a column reader this borrows the
+    /// row payload and is valid only until the next row is fetched; copy it
+    /// (e.g. via a scan `str_allocator`) to retain it longer.
     bytes: []const u8,
 
     pub fn asBytes(self: Decimal) []const u8 {

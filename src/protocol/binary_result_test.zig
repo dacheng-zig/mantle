@@ -33,6 +33,29 @@ test "binary row parses integer string and null values" {
     try std.testing.expect(row.values[2] == null);
 }
 
+test "binary row parses enum and set length-encoded strings" {
+    // Regression: ENUM (0xf7) and SET (0xf8) are transmitted as length-encoded
+    // strings in the binary protocol; they were previously omitted from
+    // `readValue` and failed with UnsupportedBinaryColumnType, inconsistent with
+    // type_mapper which classifies them as text.
+    const columns = [_]protocol.text_result.ColumnDefinition41{
+        testColumn("mood", .enum_),
+        testColumn("tags", .set),
+    };
+    const payload = [_]u8{
+        0x00,
+        0x00, // null bitmap (no nulls)
+        0x05, 'h', 'a', 'p', 'p', 'y',
+        0x03, 'a', ',', 'b',
+    };
+
+    var row = try BinaryRow.parse(std.testing.allocator, &payload, &columns);
+    defer row.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(u8, "happy", row.values[0].?);
+    try std.testing.expectEqualSlices(u8, "a,b", row.values[1].?);
+}
+
 test "binary row parses float and double raw bytes" {
     const columns = [_]protocol.text_result.ColumnDefinition41{
         testColumn("score", .float),

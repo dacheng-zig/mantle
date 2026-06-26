@@ -266,23 +266,29 @@ fn boolFromInteger(value: anytype) !bool {
 }
 
 fn readBinaryInteger(comptime T: type, value: []const u8, is_unsigned: bool) !T {
+    // The wire width is server-driven (column type) but `T` is caller-chosen, so
+    // the decoded value may not fit. Use a checked cast that surfaces an error
+    // instead of `@intCast`, which is illegal behavior (panic/UB) on overflow.
+    // This mirrors the text path's `parseInt(...) -> error.Overflow`.
     if (is_unsigned) {
-        return switch (value.len) {
-            1 => @intCast(std.mem.readInt(u8, value[0..1], .little)),
-            2 => @intCast(std.mem.readInt(u16, value[0..2], .little)),
-            4 => @intCast(std.mem.readInt(u32, value[0..4], .little)),
-            8 => @intCast(std.mem.readInt(u64, value[0..8], .little)),
-            else => error.InvalidBinaryIntegerLength,
+        const wide: u64 = switch (value.len) {
+            1 => std.mem.readInt(u8, value[0..1], .little),
+            2 => std.mem.readInt(u16, value[0..2], .little),
+            4 => std.mem.readInt(u32, value[0..4], .little),
+            8 => std.mem.readInt(u64, value[0..8], .little),
+            else => return error.InvalidBinaryIntegerLength,
         };
+        return std.math.cast(T, wide) orelse error.IntegerOverflow;
     }
 
-    return switch (value.len) {
-        1 => @intCast(@as(i8, @bitCast(std.mem.readInt(u8, value[0..1], .little)))),
-        2 => @intCast(@as(i16, @bitCast(std.mem.readInt(u16, value[0..2], .little)))),
-        4 => @intCast(@as(i32, @bitCast(std.mem.readInt(u32, value[0..4], .little)))),
-        8 => @intCast(@as(i64, @bitCast(std.mem.readInt(u64, value[0..8], .little)))),
-        else => error.InvalidBinaryIntegerLength,
+    const wide: i64 = switch (value.len) {
+        1 => @as(i8, @bitCast(std.mem.readInt(u8, value[0..1], .little))),
+        2 => @as(i16, @bitCast(std.mem.readInt(u16, value[0..2], .little))),
+        4 => @as(i32, @bitCast(std.mem.readInt(u32, value[0..4], .little))),
+        8 => @as(i64, @bitCast(std.mem.readInt(u64, value[0..8], .little))),
+        else => return error.InvalidBinaryIntegerLength,
     };
+    return std.math.cast(T, wide) orelse error.IntegerOverflow;
 }
 
 fn readBinaryFloatBytes(comptime T: type, value: []const u8) !T {

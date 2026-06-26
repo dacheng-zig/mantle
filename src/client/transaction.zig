@@ -132,7 +132,13 @@ pub const Transaction = struct {
         if (self.finished) return;
         self.markFinished();
         if (self.conn.isBroken()) return;
-        self.conn.execSimple(allocator, "ROLLBACK") catch {};
+        // A failed best-effort rollback leaves the transaction in an unknown
+        // state; mark the connection broken so the pool retires it rather than
+        // reusing a connection that may still hold an open transaction. Mirrors
+        // the explicit `rollback()` contract above.
+        self.conn.execSimple(allocator, "ROLLBACK") catch {
+            self.conn.broken = true;
+        };
     }
 };
 

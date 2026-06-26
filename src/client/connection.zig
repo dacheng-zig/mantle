@@ -239,7 +239,14 @@ pub const Connection = struct {
     }
 
     pub fn canReuse(self: *const Connection) bool {
-        return !self.closed and !self.isBroken() and self.transport.packet_stream.phase.state == .ready;
+        // A connection released with an open transaction (a leaked `Transaction`
+        // guard, or a path that skipped commit/rollback) must NOT be pooled: its
+        // server-side transaction is still open with rows uncommitted and locks
+        // held. Refuse reuse so the pool retires it; closing rolls it back
+        // server-side. Otherwise the next acquirer would silently inherit it.
+        return !self.closed and !self.isBroken() and
+            !self.in_transaction and
+            self.transport.packet_stream.phase.state == .ready;
     }
 
     /// The last server error captured on a swallowing path, if any. Borrowed;
@@ -508,6 +515,10 @@ pub const Connection = struct {
         errdefer arena.deinit();
         const arena_allocator = arena.allocator();
 
+        // Resolve field->column indices once for the whole result set instead
+        // of rescanning column names on every row.
+        const indices = try TextRowResult.resolveScanColumns(T, rows_result.columns);
+
         var list: std.ArrayList(T) = .empty;
         while (true) {
             var row = try rows_result.next(allocator);
@@ -517,7 +528,7 @@ pub const Connection = struct {
                 .err => return error.ServerError,
                 .row => {
                     var item: T = undefined;
-                    try row.scanAlloc(&item, rows_result.columns, arena_allocator);
+                    try row.scanAllocResolved(&item, rows_result.columns, &indices, arena_allocator);
                     try list.append(arena_allocator, item);
                 },
             }
@@ -597,6 +608,10 @@ pub const Connection = struct {
         errdefer arena.deinit();
         const arena_allocator = arena.allocator();
 
+        // Resolve field->column indices once for the whole result set instead
+        // of rescanning column names on every row.
+        const indices = try BinaryRowResult.resolveScanColumns(T, rows_result.columns);
+
         var list: std.ArrayList(T) = .empty;
         while (true) {
             var row = try rows_result.next(allocator);
@@ -606,7 +621,7 @@ pub const Connection = struct {
                 .err => return error.ServerError,
                 .row => {
                     var item: T = undefined;
-                    try row.scanAlloc(&item, rows_result.columns, arena_allocator);
+                    try row.scanAllocResolved(&item, rows_result.columns, &indices, arena_allocator);
                     try list.append(arena_allocator, item);
                 },
             }
@@ -677,17 +692,16 @@ pub const Connection = struct {
         sql: []const u8,
     ) !QueryResult {
         try self.ensureUsable();
-        var diagnostic_capture_failed = false;
-        errdefer |err| if (!diagnostic_capture_failed) self.classifyError(err);
+        // classifyError treats OutOfMemory (and other soft errors) as a no-op,
+        // so the OOM-on-clone path below needs no special-casing here.
+        errdefer |err| self.classifyError(err);
         logSql(sql);
         try self.transport.sendCommand(allocator, protocol.command.Command.initQuery(sql));
         var response = try self.transport.readQueryResponse(allocator);
         errdefer response.deinit(allocator);
         if (response == .err) {
-            const last_error = ServerError.cloneFrom(allocator, response.err) catch {
-                diagnostic_capture_failed = true;
+            const last_error = ServerError.cloneFrom(allocator, response.err) catch
                 return error.OutOfMemory;
-            };
             self.captureError(allocator, last_error);
         } else {
             self.clearLastError(allocator);

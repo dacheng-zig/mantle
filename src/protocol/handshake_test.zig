@@ -96,6 +96,24 @@ test "handshake parses v10 server greeting" {
     try std.testing.expectEqualSlices(u8, "caching_sha2_password", handshake.auth_plugin_name.?);
 }
 
+test "handshake keeps scramble bytes that end in 0x00" {
+    // Regression: the auth-plugin-data part 2 carries one trailing NUL
+    // terminator. The scramble is random binary and may legitimately end in
+    // 0x00; the meaningful length must come from the advertised length field,
+    // not from trimming trailing zeros (which would truncate the scramble and
+    // corrupt the auth response). Here the last scramble byte ('t', index 50)
+    // is replaced with 0x00, so the wire ends in two 0x00s: scramble[19] then
+    // the terminator.
+    var greeting = sample_handshake;
+    greeting[50] = 0x00;
+
+    const handshake = try HandshakeV10.parse(&greeting);
+
+    const expected = "abcdefghijklmnopqrs" ++ [_]u8{0x00};
+    try std.testing.expectEqual(@as(usize, 20), handshake.authPluginData().len);
+    try std.testing.expectEqualSlices(u8, expected, handshake.authPluginData());
+}
+
 test "handshake rejects invalid protocol version" {
     var bad = sample_handshake;
     bad[0] = 9;

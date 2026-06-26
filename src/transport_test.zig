@@ -181,7 +181,10 @@ test "transport rejects empty binary row payload" {
     try protocol.packet.writeLogicalPayload(&server_bytes, 0, &sample_handshake);
     try protocol.packet.writeLogicalPayload(&server_bytes, 2, &.{ 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00 });
     try protocol.packet.writeLogicalPayload(&server_bytes, 1, &.{0x01});
-    try protocol.packet.writeLogicalPayload(&server_bytes, 2, &.{0x01});
+    // A binary row packet with a valid 0x00 header but no null bitmap / values:
+    // BinaryRow.parse must reject it with EndOfPayload. (The packet classifier
+    // only inspects the leading byte; body validation belongs to the parser.)
+    try protocol.packet.writeLogicalPayload(&server_bytes, 2, &.{0x00});
 
     var io = TestByteStream.init(server_bytes.bytes());
     defer io.deinit();

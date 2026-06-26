@@ -42,8 +42,10 @@ pub const PayloadReader = struct {
 
     pub fn readLengthEncodedString(self: *PayloadReader) protocol.types.Error![]const u8 {
         const len = try self.readLengthEncodedInteger();
-        if (len > std.math.maxInt(usize)) return error.LengthOverflow;
-        return self.readBytes(@intCast(len));
+        // `std.math.cast` is a no-op on 64-bit but guards the narrowing on
+        // 32-bit targets, where a >4 GiB length would otherwise panic on cast.
+        const len_usize = std.math.cast(usize, len) orelse return error.LengthOverflow;
+        return self.readBytes(len_usize);
     }
 
     pub fn readNullTerminatedString(self: *PayloadReader) protocol.types.Error![]const u8 {
@@ -65,7 +67,10 @@ pub const PayloadReader = struct {
         return bytes[0..len];
     }
 
-    pub fn readBytesAtMostUntilNul(self: *PayloadReader, max_len: usize) protocol.types.Error![]const u8 {
+    /// Consume up to `max_len` bytes (fewer only if the payload ends first) and
+    /// return them as a borrowed slice. Does NOT scan for or stop at a NUL — the
+    /// caller decides how to interpret the bytes.
+    pub fn readBytesAtMost(self: *PayloadReader, max_len: usize) protocol.types.Error![]const u8 {
         const len = @min(max_len, self.remaining());
         const bytes = self.payload[self.pos .. self.pos + len];
         self.pos += len;

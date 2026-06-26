@@ -219,6 +219,13 @@ test "connection can reuse after successful handshake" {
     try conn.finishHandshake(std.testing.allocator);
 
     try std.testing.expect(conn.canReuse());
+
+    // A connection with an open transaction must not be pooled even though the
+    // phase is `ready`, otherwise the next acquirer inherits the transaction.
+    conn.in_transaction = true;
+    try std.testing.expect(!conn.canReuse());
+    conn.in_transaction = false;
+    try std.testing.expect(conn.canReuse());
 }
 
 test "connection cannot reuse after graceful close" {
@@ -650,6 +657,76 @@ test "connection queryRows streams text rows until eof" {
     defer eof.deinit(std.testing.allocator);
     try std.testing.expectEqual(TextRowResultTag.eof, eof.tag);
     try std.testing.expectEqual(mantle.ConnectionPhase.State.ready, conn.transport.packet_stream.phase.state);
+}
+
+test "connection queryAll scans text rows into structs via resolved indices" {
+    var server_bytes = protocol.PayloadWriter.init(std.testing.allocator);
+    defer server_bytes.deinit();
+    try protocol.packet.writeLogicalPayload(&server_bytes, 0, &sample_handshake);
+    try protocol.packet.writeLogicalPayload(&server_bytes, 2, &.{ 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00 });
+    try protocol.packet.writeLogicalPayload(&server_bytes, 1, &.{0x02});
+    try writeTestColumnDefinition(&server_bytes, 2, "id", .long);
+    try writeTestColumnDefinition(&server_bytes, 3, "name", .var_string);
+    try protocol.packet.writeLogicalPayload(&server_bytes, 4, &.{ 0xfe, 0x00, 0x00, 0x02, 0x00 });
+    try protocol.packet.writeLogicalPayload(&server_bytes, 5, &.{ 0x01, '1', 0x03, 'o', 'n', 'e' });
+    try protocol.packet.writeLogicalPayload(&server_bytes, 6, &.{ 0x01, '2', 0x03, 't', 'w', 'o' });
+    try protocol.packet.writeLogicalPayload(&server_bytes, 7, &.{ 0xfe, 0x00, 0x00, 0x02, 0x00 });
+
+    var io = TestByteStream.init(server_bytes.bytes());
+    defer io.deinit();
+    var conn = Connection.init(.{
+        .reader = io.reader(),
+        .writer = io.writer(),
+    }, .{
+        .username = "root",
+        .password = "secret",
+        .character_set = protocol.collation.utf8mb4_general_ci,
+    });
+    defer conn.deinit(std.testing.allocator);
+
+    try conn.finishHandshake(std.testing.allocator);
+    io.written.clearRetainingCapacity();
+
+    const Row = struct { id: i32, name: []const u8 };
+    var table = try conn.queryAll(Row, std.testing.allocator, "select id, name from t");
+    defer table.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), table.rows.len);
+    try std.testing.expectEqual(@as(i32, 1), table.rows[0].id);
+    try std.testing.expectEqualSlices(u8, "one", table.rows[0].name);
+    try std.testing.expectEqual(@as(i32, 2), table.rows[1].id);
+    try std.testing.expectEqualSlices(u8, "two", table.rows[1].name);
+}
+
+test "connection queryAll surfaces unknown column name from resolution" {
+    var server_bytes = protocol.PayloadWriter.init(std.testing.allocator);
+    defer server_bytes.deinit();
+    try protocol.packet.writeLogicalPayload(&server_bytes, 0, &sample_handshake);
+    try protocol.packet.writeLogicalPayload(&server_bytes, 2, &.{ 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00 });
+    try protocol.packet.writeLogicalPayload(&server_bytes, 1, &.{0x01});
+    try writeTestColumnDefinition(&server_bytes, 2, "id", .long);
+    try protocol.packet.writeLogicalPayload(&server_bytes, 3, &.{ 0xfe, 0x00, 0x00, 0x02, 0x00 });
+    try protocol.packet.writeLogicalPayload(&server_bytes, 4, &.{ 0x01, '1' });
+    try protocol.packet.writeLogicalPayload(&server_bytes, 5, &.{ 0xfe, 0x00, 0x00, 0x02, 0x00 });
+
+    var io = TestByteStream.init(server_bytes.bytes());
+    defer io.deinit();
+    var conn = Connection.init(.{
+        .reader = io.reader(),
+        .writer = io.writer(),
+    }, .{
+        .username = "root",
+        .password = "secret",
+        .character_set = protocol.collation.utf8mb4_general_ci,
+    });
+    defer conn.deinit(std.testing.allocator);
+
+    try conn.finishHandshake(std.testing.allocator);
+    io.written.clearRetainingCapacity();
+
+    // The destination has a field with no matching column; resolution must fail.
+    const Row = struct { missing: i32 };
+    try std.testing.expectError(error.UnknownColumnName, conn.queryAll(Row, std.testing.allocator, "select id from t"));
 }
 
 test "connection queryRows drains column definitions before rows" {

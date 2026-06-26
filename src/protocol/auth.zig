@@ -54,6 +54,8 @@ pub const AuthPacketTag = enum {
     }
 };
 
+/// Borrowed view: `plugin_name` and `plugin_data` alias the parsed `payload`
+/// and are valid only while it lives.
 pub const AuthSwitchRequest = struct {
     plugin: AuthPlugin,
     plugin_name: []const u8,
@@ -72,6 +74,8 @@ pub const AuthSwitchRequest = struct {
     }
 };
 
+/// Borrowed view: `data` aliases the parsed `payload` and is valid only while
+/// it lives.
 pub const AuthMoreData = struct {
     data: []const u8,
 
@@ -214,7 +218,12 @@ pub fn decodePublicKey(allocator: std.mem.Allocator, public_key_pem: []const u8)
     const spki = try Element.parse(der, 0);
     const algorithm = try Element.parse(der, spki.slice.start);
     const bitstring = try Element.parse(der, algorithm.slice.end);
-    const rsa_der = std.mem.trim(u8, der[bitstring.slice.start..bitstring.slice.end], &.{0});
+    // A BIT STRING value begins with a single "unused bits" octet (0x00 for the
+    // byte-aligned RSA key). Skip exactly that octet — trimming all zero bytes
+    // could corrupt a DER body that legitimately ends in 0x00.
+    const bitstring_content = der[bitstring.slice.start..bitstring.slice.end];
+    if (bitstring_content.len == 0 or bitstring_content[0] != 0x00) return error.InvalidPublicKey;
+    const rsa_der = bitstring_content[1..];
 
     const parsed = try PublicKey.parseDer(rsa_der);
     const value = try PublicKey.fromBytes(parsed.exponent, parsed.modulus);
@@ -243,8 +252,12 @@ fn encryptPassword(
 }
 
 // RSAES-OAEP encryption (PKCS#1 v2.1) with SHA-1 and an empty label, mirroring
-// MySQL's RSA_PKCS1_OAEP_PADDING. The seed is left zeroed: MySQL accepts a
-// deterministic seed and we avoid depending on a CSPRNG here.
+// MySQL's RSA_PKCS1_OAEP_PADDING. The OAEP random-seed input is fixed to zero
+// (deterministic OAEP) to avoid depending on a CSPRNG here; the seed slice is
+// then overwritten by `mgf1Xor(seed, db)` so the emitted seed is MGF1(maskedDB),
+// not zero. Per-connection ciphertext uniqueness still holds because the
+// password is XORed with the connection nonce (see `encryptPassword`) before
+// this runs, so identical passwords encrypt differently on each connection.
 fn rsaEncryptOaep(allocator: std.mem.Allocator, msg: []const u8, pk: *const PublicKey) ![]u8 {
     const Hash = Sha1;
     const digest_len = Hash.digest_length;

@@ -70,6 +70,13 @@ pub const AcquireError = error{
 ///   - `pub fn nowNs(self: *const Driver) u64`
 /// `Handle` must expose `canReuse()` and `isBroken()` (and, for ergonomics,
 /// whatever accessor users need to run queries — e.g. a public `conn` field).
+///
+/// Optional capability: a `Driver` that also exposes
+/// `pub fn killQuery(self: *Driver, a: Allocator, thread_id: u32) !void` and
+/// whose `Handle` has a `conn: Connection` field unlocks the TCP-oriented
+/// `killQuery` / `watchdog` / `queryTimed` helpers below. Pools over drivers
+/// without it (e.g. the offline mock) simply never instantiate those methods;
+/// calling them is a clear compile error.
 pub fn Pool(comptime Driver: type) type {
     return struct {
         const Self = @This();
@@ -393,6 +400,9 @@ pub fn Pool(comptime Driver: type) type {
         /// the interrupted query returns ER_QUERY_INTERRUPTED. Only available
         /// when the driver implements `killQuery` (e.g. `TcpDriver`).
         pub fn killQuery(self: *Self, thread_id: u32) !void {
+            if (!@hasDecl(Driver, "killQuery"))
+                @compileError(@typeName(Driver) ++ " does not support killQuery; this helper " ++
+                    "requires a driver that exposes `killQuery` (e.g. TcpDriver)");
             return self.driver.killQuery(self.allocator, thread_id);
         }
 
@@ -448,6 +458,9 @@ pub fn Pool(comptime Driver: type) type {
             sql: []const u8,
             timeout: zio.Duration,
         ) !mantle.QueryResult {
+            if (!@hasDecl(Driver, "killQuery"))
+                @compileError(@typeName(Driver) ++ " does not support queryTimed; this helper " ++
+                    "requires a driver with `killQuery` and a `Handle.conn` connection (e.g. TcpDriver)");
             const conn = &lease.handle().conn;
             var guard = self.watchdog(conn.serverThreadId(), timeout);
             try guard.arm();
@@ -573,6 +586,10 @@ pub const TcpDriver = struct {
             .reader = handle.zs.reader(),
             .writer = handle.zs.writer(),
         }, self.target.options);
+        // A failed handshake captures the server's reason (e.g. "Access denied")
+        // into `conn.last_error`, whose duped message must be released; `close`
+        // is never reached on this path, so deinit the connection explicitly.
+        errdefer handle.conn.deinit(allocator);
         try handle.conn.finishHandshake(allocator);
 
         return handle;

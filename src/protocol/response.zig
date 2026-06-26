@@ -23,6 +23,8 @@ pub const GenericResponse = struct {
     }
 };
 
+/// Borrowed view: `info` and `session_state_info` alias the parsed `payload`
+/// and are valid only while it lives. Copy them to retain beyond the packet.
 pub const OkResponse = struct {
     affected_rows: u64,
     last_insert_id: u64,
@@ -68,6 +70,9 @@ pub const OkResponse = struct {
     }
 };
 
+/// Borrowed view: `message` aliases the parsed `payload` and is valid only
+/// while it lives. `ServerError.clone` copies it for callers that must retain
+/// the error past the packet buffer.
 pub const ErrorResponse = struct {
     error_code: u16,
     sql_state: ?[5]u8,

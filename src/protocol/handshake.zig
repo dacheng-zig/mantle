@@ -2,6 +2,9 @@ const std = @import("std");
 
 const protocol = @import("protocol.zig");
 
+/// Borrowed view: `server_version` and `auth_plugin_name` alias the parsed
+/// `payload` and are valid only while it lives. The scramble is copied into the
+/// inline `auth_plugin_data_storage`, so `authPluginData()` is self-owned.
 pub const HandshakeV10 = struct {
     server_version: []const u8,
     connection_id: u32,
@@ -35,12 +38,23 @@ pub const HandshakeV10 = struct {
         const auth_plugin_data_len_field = try reader.readInt(u8);
         _ = try reader.readFixedBytes(10);
 
-        const auth_part_2_len = if ((capability_flags & protocol.capability.client_plugin_auth) != 0)
-            @max(@as(usize, 13), @as(usize, auth_plugin_data_len_field) -| 8)
+        const len_field: usize = auth_plugin_data_len_field;
+        // Part 2 occupies max(13, len-8) bytes on the wire. We must consume the
+        // whole window so the auth-plugin name that follows is positioned right.
+        const auth_part_2_window_len = if ((capability_flags & protocol.capability.client_plugin_auth) != 0)
+            @max(@as(usize, 13), len_field -| 8)
         else
             @as(usize, 13);
-        const auth_part_2_with_nul = try reader.readBytesAtMostUntilNul(auth_part_2_len);
-        const auth_part_2 = trimTrailingNul(auth_part_2_with_nul);
+        const auth_part_2_window = try reader.readBytesAtMost(auth_part_2_window_len);
+        // The scramble is random binary that may legitimately contain or end in
+        // 0x00, so we must NOT trim trailing NULs. Part 2 carries exactly one
+        // trailing NUL terminator after the scramble; derive the meaningful
+        // length from the advertised total (`len_field`) instead of scanning.
+        const meaningful_part_2_len = if (len_field > 8)
+            @min(auth_part_2_window.len, len_field - 9) // len_field = 8 + scramble_part2 + 1 NUL
+        else
+            auth_part_2_window.len -| 1; // legacy: drop the single NUL terminator
+        const auth_part_2 = auth_part_2_window[0..meaningful_part_2_len];
         const auth_plugin_data_len = auth_part_1.len + auth_part_2.len;
         if (auth_plugin_data_len > 32) return error.LengthOverflow;
         var auth_plugin_data_storage: [32]u8 = @splat(0);
@@ -64,12 +78,6 @@ pub const HandshakeV10 = struct {
         };
     }
 };
-
-fn trimTrailingNul(bytes: []const u8) []const u8 {
-    var end = bytes.len;
-    while (end > 0 and bytes[end - 1] == 0) : (end -= 1) {}
-    return bytes[0..end];
-}
 
 pub const HandshakeResponse41 = struct {
     pub const Attribute = struct {
