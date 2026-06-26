@@ -132,6 +132,10 @@ pub const BinaryResultRow = struct {
 pub const Transport = struct {
     io: Io,
     packet_stream: mantle.PacketStream,
+    /// Server error from a failed handshake/auth exchange (e.g. "Access
+    /// denied"), cloned before the source payload is freed. `finishHandshake`
+    /// takes ownership via `takeHandshakeError`; null otherwise.
+    handshake_error: ?ServerError = null,
 
     pub const Io = struct {
         reader: AnyReader,
@@ -145,6 +149,13 @@ pub const Transport = struct {
         };
     }
 
+    /// Transfer ownership of a captured handshake error to the caller, which
+    /// must `deinit` it. Clears the stored error.
+    pub fn takeHandshakeError(self: *Transport) ?ServerError {
+        defer self.handshake_error = null;
+        return self.handshake_error;
+    }
+
     pub fn receiveNext(self: *Transport, allocator: std.mem.Allocator) !mantle.ConnectionPhase.Action {
         const logical_payload = try readLogicalPayload(
             allocator,
@@ -154,6 +165,11 @@ pub const Transport = struct {
         defer allocator.free(logical_payload.payload);
         self.packet_stream.next_sequence_id = logical_payload.next_sequence_id;
 
+        // Captured before `receiveServerPayload` advances the state machine so
+        // we know whether a failure came from the initial handshake (no
+        // SQLSTATE) or the auth exchange (CLIENT_PROTOCOL_41 ERR with SQLSTATE).
+        const prev_state = self.packet_stream.phase.state;
+
         var framed_client = protocol.PayloadWriter.init(allocator);
         defer framed_client.deinit();
 
@@ -161,7 +177,30 @@ pub const Transport = struct {
         if (framed_client.bytes().len > 0) {
             try self.io.writer.writeAll(framed_client.bytes());
         }
+
+        if (self.packet_stream.phase.state == .failed and isErrorPayload(logical_payload.payload)) {
+            self.captureHandshakeError(allocator, prev_state, logical_payload.payload);
+        }
         return action;
+    }
+
+    /// Best-effort: clone the handshake/auth ERR so the caller can surface it.
+    /// A parse or allocation failure leaves `handshake_error` null and the
+    /// handshake still fails with the generic error, so it is never masked.
+    fn captureHandshakeError(
+        self: *Transport,
+        allocator: std.mem.Allocator,
+        prev_state: mantle.ConnectionPhase.State,
+        payload: []const u8,
+    ) void {
+        const capabilities: u32 = switch (prev_state) {
+            .awaiting_handshake => 0,
+            else => protocol.capability.client_protocol_41,
+        };
+        const parsed = protocol.response.ErrorResponse.parse(payload, capabilities) catch return;
+        const cloned = ServerError.clone(allocator, parsed) catch return;
+        if (self.handshake_error) |*err| err.deinit(allocator);
+        self.handshake_error = cloned;
     }
 
     pub fn sendCommand(

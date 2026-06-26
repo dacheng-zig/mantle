@@ -162,6 +162,12 @@ pub const Connection = struct {
         self.statement_cache.clearAll(allocator, false);
         if (self.last_error) |*err| err.deinit(allocator);
         self.last_error = null;
+        // Release a handshake error that was captured but never taken (e.g. a
+        // caller that drove `receiveNext` directly and dropped the connection).
+        if (self.transport.takeHandshakeError()) |captured| {
+            var err = captured;
+            err.deinit(allocator);
+        }
     }
 
     /// Resize the prepared-statement cache. `0` disables caching and drops any
@@ -325,7 +331,13 @@ pub const Connection = struct {
         while (true) {
             switch (self.transport.packet_stream.phase.state) {
                 .ready => return,
-                .failed => return error.HandshakeFailed,
+                .failed => {
+                    // Surface the server's reason (e.g. "Access denied") via
+                    // `lastError()` and the diagnostic log; the handshake still
+                    // fails with `HandshakeFailed` regardless.
+                    if (self.transport.takeHandshakeError()) |err| self.captureError(allocator, err);
+                    return error.HandshakeFailed;
+                },
                 else => _ = try self.transport.receiveNext(allocator),
             }
         }

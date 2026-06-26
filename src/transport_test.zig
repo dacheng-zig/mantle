@@ -44,6 +44,38 @@ test "transport reads server handshake and writes framed client response" {
     try std.testing.expect(header.payload_length > 0);
 }
 
+test "transport captures access-denied error from failed handshake" {
+    var server_bytes = protocol.PayloadWriter.init(std.testing.allocator);
+    defer server_bytes.deinit();
+    try protocol.packet.writeLogicalPayload(&server_bytes, 0, &sample_handshake);
+    // ERR(1045) #28000 "Access denied" — the auth response gets rejected.
+    const auth_err = [_]u8{ 0xff, 0x15, 0x04, '#', '2', '8', '0', '0', '0' } ++ "Access denied".*;
+    try protocol.packet.writeLogicalPayload(&server_bytes, 2, &auth_err);
+
+    var io = TestByteStream.init(server_bytes.bytes());
+    defer io.deinit();
+    var stream = mantle.Transport.init(.{
+        .reader = io.reader(),
+        .writer = io.writer(),
+    }, .{
+        .username = "root",
+        .password = "secret",
+        .character_set = protocol.collation.utf8mb4_general_ci,
+    });
+
+    _ = try stream.receiveNext(std.testing.allocator); // handshake -> send response
+    _ = try stream.receiveNext(std.testing.allocator); // auth ERR -> failed
+    try std.testing.expectEqual(mantle.ConnectionPhase.State.failed, stream.packet_stream.phase.state);
+
+    var captured = stream.takeHandshakeError() orelse return error.TestExpectedHandshakeError;
+    defer captured.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 1045), captured.code);
+    try std.testing.expectEqualSlices(u8, "28000", &captured.sql_state.?);
+    try std.testing.expectEqualSlices(u8, "Access denied", captured.message);
+    // Ownership transferred: a second take yields nothing.
+    try std.testing.expect(stream.takeHandshakeError() == null);
+}
+
 test "transport writes command packet after connection is ready" {
     var server_bytes = protocol.PayloadWriter.init(std.testing.allocator);
     defer server_bytes.deinit();

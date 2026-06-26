@@ -22,6 +22,19 @@ pub const ConnectionPhase = struct {
         local_infile_request,
     };
 
+    /// Progress within the `authenticating` state. caching_sha2_password may
+    /// fall back to full authentication (RSA public-key exchange) when the
+    /// server's fast-auth cache check misses — which happens on a wrong password
+    /// or a cold cache. See `receiveAuthPacket`.
+    pub const AuthStep = enum {
+        /// Initial scramble (or post-switch scramble) has been sent.
+        scramble_sent,
+        /// A public-key request has been sent; the next packet is the RSA key.
+        public_key_requested,
+        /// The RSA-encrypted password has been sent; awaiting OK/ERR.
+        encrypted_password_sent,
+    };
+
     pub const Options = struct {
         username: []const u8,
         password: []const u8,
@@ -36,12 +49,31 @@ pub const ConnectionPhase = struct {
     /// target this session with `KILL QUERY` from another connection.
     /// Zero until the handshake is received.
     server_connection_id: u32 = 0,
+    /// Auth plugin negotiated in the handshake (or switched to). Drives the
+    /// full-authentication exchange.
+    auth_plugin: protocol.auth.AuthPlugin = .unknown,
+    /// Sub-state within `authenticating`.
+    auth_step: AuthStep = .scramble_sent,
+    /// The current auth seed (handshake nonce, or the switch request's data).
+    /// Needed to obfuscate the password during RSA full authentication.
+    auth_seed_storage: [32]u8 = @splat(0),
+    auth_seed_len: usize = 0,
 
     pub fn init(options: Options) ConnectionPhase {
         return .{
             .state = .awaiting_handshake,
             .options = options,
         };
+    }
+
+    fn setAuthSeed(self: *ConnectionPhase, seed: []const u8) void {
+        const len = @min(seed.len, self.auth_seed_storage.len);
+        @memcpy(self.auth_seed_storage[0..len], seed[0..len]);
+        self.auth_seed_len = len;
+    }
+
+    fn authSeed(self: *const ConnectionPhase) []const u8 {
+        return self.auth_seed_storage[0..self.auth_seed_len];
     }
 
     pub fn receiveInitialHandshake(
@@ -62,6 +94,9 @@ pub const ConnectionPhase = struct {
             .database = self.options.database,
         }, handshake);
         const auth_plugin = protocol.auth.AuthPlugin.fromName(negotiation.auth_plugin_name);
+        self.auth_plugin = auth_plugin;
+        self.setAuthSeed(handshake.authPluginData());
+        self.auth_step = .scramble_sent;
         var auth_response_storage: [32]u8 = undefined;
         const auth_response = try makeAuthResponse(
             &auth_response_storage,
@@ -101,6 +136,9 @@ pub const ConnectionPhase = struct {
             },
             .auth_switch_request => {
                 const request = try protocol.auth.AuthSwitchRequest.parse(payload);
+                self.auth_plugin = request.plugin;
+                self.setAuthSeed(request.plugin_data);
+                self.auth_step = .scramble_sent;
                 var storage: [32]u8 = undefined;
                 const auth_response = try makeAuthResponse(
                     &storage,
@@ -111,13 +149,47 @@ pub const ConnectionPhase = struct {
                 try protocol.auth.writeScrambleResponse(writer, auth_response);
                 return .send_auth_response;
             },
-            .auth_more_data => {
-                const more = try protocol.auth.AuthMoreData.parse(payload);
-                if (more.isCachingSha2FastAuthSuccess()) return .none;
-                return error.UnsupportedAuthExchange;
-            },
+            .auth_more_data => self.receiveAuthMoreData(writer, payload),
             .unknown => error.UnsupportedAuthExchange,
         };
+    }
+
+    /// Handle an AuthMoreData packet during `authenticating`. For
+    /// caching_sha2_password this drives the full-authentication fallback the
+    /// server requests when its fast-auth cache check misses (cold cache or
+    /// wrong password): request the RSA public key, then send the encrypted
+    /// password. Over a secure channel the server short-circuits with OK, which
+    /// is handled by the `.ok` branch in `receiveAuthPacket` instead.
+    fn receiveAuthMoreData(
+        self: *ConnectionPhase,
+        writer: *protocol.PayloadWriter,
+        payload: []const u8,
+    ) !Action {
+        const more = try protocol.auth.AuthMoreData.parse(payload);
+        switch (self.auth_step) {
+            .public_key_requested => {
+                // `more.data` is the server's PEM-encoded RSA public key.
+                const encrypted = try protocol.auth.encryptPasswordWithPublicKey(
+                    writer.allocator,
+                    self.options.password,
+                    self.authSeed(),
+                    more.data,
+                );
+                defer writer.allocator.free(encrypted);
+                try writer.writeBytes(encrypted);
+                self.auth_step = .encrypted_password_sent;
+                return .send_auth_response;
+            },
+            .scramble_sent, .encrypted_password_sent => {
+                if (more.isCachingSha2FastAuthSuccess()) return .none;
+                if (more.isCachingSha2FullAuthenticationStart()) {
+                    try protocol.auth.writePublicKeyRequest(writer, self.auth_plugin);
+                    self.auth_step = .public_key_requested;
+                    return .send_auth_response;
+                }
+                return error.UnsupportedAuthExchange;
+            },
+        }
     }
 
     pub fn sendCommand(

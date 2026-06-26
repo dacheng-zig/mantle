@@ -74,6 +74,10 @@ pub const Db = struct {
             .reader = self.zs.reader(),
             .writer = self.zs.writer(),
         }, cfg.options());
+        // On handshake failure the connection captures the server's error
+        // (e.g. "Access denied") into `lastError()`; release it on the error
+        // path so a failed connect does not leak.
+        errdefer self.conn.deinit(gpa);
         try self.conn.finishHandshake(gpa);
     }
 

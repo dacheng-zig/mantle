@@ -126,3 +126,46 @@ test "auth writes public key request marker" {
 
     try std.testing.expectEqualSlices(u8, &.{caching_sha2_password_public_key_request}, writer.bytes());
 }
+
+const sample_public_key_pem =
+    \\-----BEGIN PUBLIC KEY-----
+    \\MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2QurErkXa1sGRr1AV4wJ
+    \\m7cT0aSDrLsA+PHT8D6yjWhLEOocBzxuK0Z/1ytBAjRH9LtCbyHML81OIIACt03u
+    \\Y+8xbtFLyOP0NxsLe5FzQ+R4PPQDnubtJeSa4E7jZZEIkAWS11cPo7/wXX3elfeb
+    \\tzJDEjvFa7VDTcD1jh+0p03k+iPbt9f91+PauD/oCr0RbgL737/UTeN7F5sXCS9F
+    \\OOPW+bqgdPV08c4Dx4qSxg9WrktRUA9RDxWdetzYyNVc9/+VsKbnCUFQuGCevvWi
+    \\MHxq6dOI8fy+OYkaNo3UbU+4surE+JVIEdvAkhwVDN3DBBZ6gtpU5PukS4mcpUPt
+    \\wQIDAQAB
+    \\-----END PUBLIC KEY-----
+;
+
+test "auth decodes RSA public key from PEM" {
+    const decoded = try auth.decodePublicKey(std.testing.allocator, sample_public_key_pem);
+    defer decoded.deinit(std.testing.allocator);
+    // The sample key is RSA-2048.
+    try std.testing.expectEqual(@as(usize, 2048), decoded.value.n.bits());
+}
+
+test "auth rejects PEM without public key markers" {
+    try std.testing.expectError(error.InvalidPublicKey, auth.decodePublicKey(std.testing.allocator, "not a pem"));
+}
+
+test "auth encrypts password to modulus-sized ciphertext" {
+    const seed = [_]u8{ 10, 47, 74, 111, 75, 73, 34, 48, 88, 76, 114, 74, 37, 13, 3, 80, 82, 2, 23, 21 };
+    const cipher = try auth.encryptPasswordWithPublicKey(
+        std.testing.allocator,
+        "secret",
+        &seed,
+        sample_public_key_pem,
+    );
+    defer std.testing.allocator.free(cipher);
+
+    // RSA-2048 ciphertext is exactly 256 bytes and must not leak the plaintext.
+    try std.testing.expectEqual(@as(usize, 256), cipher.len);
+    try std.testing.expect(std.mem.indexOf(u8, cipher, "secret") == null);
+    var all_zero = true;
+    for (cipher) |b| {
+        if (b != 0) all_zero = false;
+    }
+    try std.testing.expect(!all_zero);
+}
