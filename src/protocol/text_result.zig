@@ -155,9 +155,17 @@ pub const TextRow = struct {
     ) !TextRow {
         const values = try allocator.alloc(?[]const u8, column_count);
         errdefer allocator.free(values);
+        try fillValues(payload, values);
+        return .{ .values = values };
+    }
 
+    /// Decode the row's columns into `out` (one slot per column), each value
+    /// aliasing `payload`. Shared by the owned `parse` and the reused-buffer
+    /// collector path (`Transport.readTextRowReusing`), so both decode rows the
+    /// same way without a per-row `values` allocation in the collector.
+    pub fn fillValues(payload: []const u8, out: []?[]const u8) protocol.types.Error!void {
         var reader = protocol.PayloadReader.init(payload);
-        for (values) |*value| {
+        for (out) |*value| {
             if (reader.remaining() == 0) return error.EndOfPayload;
             if (try reader.peek() == 0xfb) {
                 _ = try reader.readInt(u8);
@@ -167,7 +175,6 @@ pub const TextRow = struct {
             }
         }
         if (reader.remaining() != 0) return error.MalformedResultSetPacket;
-        return .{ .values = values };
     }
 
     pub fn deinit(self: *TextRow, allocator: std.mem.Allocator) void {
@@ -180,7 +187,7 @@ pub const ResultPacketTag = enum {
     eof,
     err,
 
-    pub fn classify(payload: []const u8, column_count: usize) protocol.types.Error!ResultPacketTag {
+    pub fn classify(payload: []const u8) protocol.types.Error!ResultPacketTag {
         // The leading byte fully disambiguates the packet kind: 0xff is ERR,
         // 0xfe with a short payload is EOF (a length-encoded string can never
         // start with 0xfe in a row of plausible length), everything else is a
@@ -188,7 +195,6 @@ pub const ResultPacketTag = enum {
         // row — `TextRow.parse` does that on the same payload immediately after,
         // and a full column scan in classify would double the per-column decode
         // work on the hottest path. The binary path classifies the same way.
-        _ = column_count;
         if (payload.len == 0) return error.EndOfPayload;
         if (payload[0] == 0xff) return .err;
         if (payload[0] == 0xfe and payload.len < 9) return .eof;

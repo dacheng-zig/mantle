@@ -81,6 +81,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "crud", .file = "examples/03_crud.zig" },
         .{ .name = "transaction", .file = "examples/04_transaction.zig" },
         .{ .name = "pool", .file = "examples/05_pool.zig" },
+        .{ .name = "tls", .file = "examples/06_tls.zig" },
     };
 
     const examples_step = b.step("examples", "Build the example programs");

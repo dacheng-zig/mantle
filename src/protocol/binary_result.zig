@@ -10,6 +10,22 @@ pub const BinaryRow = struct {
         payload: []const u8,
         columns: []const protocol.text_result.ColumnDefinition41,
     ) !BinaryRow {
+        const values = try allocator.alloc(?[]const u8, columns.len);
+        errdefer allocator.free(values);
+        try fillValues(payload, columns, values);
+        return .{ .values = values };
+    }
+
+    /// Decode the binary row's columns into `out` (length must equal
+    /// `columns.len`), each value aliasing `payload`. Shared by the owned
+    /// `parse` and the reused-buffer collector path
+    /// (`Transport.readBinaryRowReusing`), so the collector decodes rows without
+    /// a per-row `values` allocation.
+    pub fn fillValues(
+        payload: []const u8,
+        columns: []const protocol.text_result.ColumnDefinition41,
+        out: []?[]const u8,
+    ) !void {
         if (payload.len == 0 or payload[0] != 0x00) return error.InvalidBinaryRowHeader;
 
         var reader = protocol.PayloadReader.init(payload);
@@ -19,20 +35,16 @@ pub const BinaryRow = struct {
         if (reader.remaining() < null_bitmap_len) return error.EndOfPayload;
         const null_bitmap = reader.readBytes(null_bitmap_len) catch return error.EndOfPayload;
 
-        const values = try allocator.alloc(?[]const u8, columns.len);
-        errdefer allocator.free(values);
-
         for (columns, 0..) |column, index| {
             if (isNull(null_bitmap, index)) {
-                values[index] = null;
+                out[index] = null;
                 continue;
             }
 
-            values[index] = try readValue(&reader, column.field_type);
+            out[index] = try readValue(&reader, column.field_type);
         }
 
         if (!reader.finished()) return error.MalformedResultSetPacket;
-        return .{ .values = values };
     }
 
     pub fn deinit(self: *BinaryRow, allocator: std.mem.Allocator) void {

@@ -133,16 +133,44 @@ pub const HandshakeResponse41 = struct {
     }
 };
 
+/// The `SSLRequest` packet: the first 32 bytes of a `HandshakeResponse41`
+/// (client capability flags with `CLIENT_SSL` set, max packet size, character
+/// set, and 23 reserved zero bytes), sent before the TLS handshake. The server
+/// reads it, upgrades the socket to TLS, then expects the full
+/// `HandshakeResponse41` over the encrypted channel.
+pub const SSLRequest = struct {
+    pub const Options = struct {
+        client_flags: u32,
+        max_packet_size: u32,
+        character_set: u8,
+    };
+
+    pub fn write(writer: *protocol.PayloadWriter, options: Options) !void {
+        try writer.writeInt(u32, options.client_flags);
+        try writer.writeInt(u32, options.max_packet_size);
+        try writer.writeInt(u8, options.character_set);
+        try writeZeroes(writer, 23);
+    }
+};
+
 pub const NegotiatedHandshake = struct {
     client_flags: u32,
     auth_plugin_name: []const u8,
     client_plugin_name: ?[]const u8,
     database: ?[]const u8,
+    /// True when the client both requested TLS and the server advertised
+    /// `CLIENT_SSL`; the caller must send an `SSLRequest` and upgrade before
+    /// the `HandshakeResponse41`.
+    use_ssl: bool,
 };
 
 pub fn negotiateClientFlags(
     options: struct {
         database: ?[]const u8,
+        /// Whether the client wants to upgrade to TLS (derived from the
+        /// connection's `tls.Mode`). Only honored when the server advertises
+        /// `CLIENT_SSL`.
+        request_tls: bool = false,
     },
     handshake: HandshakeV10,
 ) NegotiatedHandshake {
@@ -164,11 +192,18 @@ pub fn negotiateClientFlags(
         client_flags |= protocol.capability.client_connect_with_db;
     }
 
+    const use_ssl = options.request_tls and
+        (handshake.capability_flags & protocol.capability.client_ssl) != 0;
+    if (use_ssl) {
+        client_flags |= protocol.capability.client_ssl;
+    }
+
     return .{
         .client_flags = client_flags,
         .auth_plugin_name = auth_plugin_name,
         .client_plugin_name = if (negotiated_plugin_auth) auth_plugin_name else null,
         .database = if ((client_flags & protocol.capability.client_connect_with_db) != 0) options.database else null,
+        .use_ssl = use_ssl,
     };
 }
 

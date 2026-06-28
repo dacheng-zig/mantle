@@ -519,16 +519,23 @@ pub const Connection = struct {
         // of rescanning column names on every row.
         const indices = try TextRowResult.resolveScanColumns(T, rows_result.columns);
 
+        // One reusable payload/values buffer for the whole set: each row is
+        // copied into the arena before the next read, so no per-row allocation.
+        var scratch: mantle.transport.RowScratch = .{};
+        defer scratch.deinit(allocator);
+
         var list: std.ArrayList(T) = .empty;
         while (true) {
-            var row = try rows_result.next(allocator);
-            defer row.deinit(allocator);
-            switch (row.tag) {
+            const view = try self.transport.readTextRowReusing(allocator, &scratch);
+            switch (view.tag) {
                 .eof => break,
-                .err => return error.ServerError,
+                .err => {
+                    if (view.server_error) |err| self.captureError(allocator, err);
+                    return error.ServerError;
+                },
                 .row => {
                     var item: T = undefined;
-                    try row.scanAllocResolved(&item, rows_result.columns, &indices, arena_allocator);
+                    try TextRowResult.scanBorrowedResolved(T, &item, rows_result.columns, view.values, &indices, arena_allocator);
                     try list.append(arena_allocator, item);
                 },
             }
@@ -612,16 +619,22 @@ pub const Connection = struct {
         // of rescanning column names on every row.
         const indices = try BinaryRowResult.resolveScanColumns(T, rows_result.columns);
 
+        // One reusable payload/values buffer for the whole set (see `queryAll`).
+        var scratch: mantle.transport.RowScratch = .{};
+        defer scratch.deinit(allocator);
+
         var list: std.ArrayList(T) = .empty;
         while (true) {
-            var row = try rows_result.next(allocator);
-            defer row.deinit(allocator);
-            switch (row.tag) {
+            const view = try self.transport.readBinaryRowReusing(allocator, rows_result.columns, &scratch);
+            switch (view.tag) {
                 .eof => break,
-                .err => return error.ServerError,
+                .err => {
+                    if (view.server_error) |err| self.captureError(allocator, err);
+                    return error.ServerError;
+                },
                 .row => {
                     var item: T = undefined;
-                    try row.scanAllocResolved(&item, rows_result.columns, &indices, arena_allocator);
+                    try BinaryRowResult.scanBorrowedResolved(T, &item, rows_result.columns, view.values, &indices, arena_allocator);
                     try list.append(arena_allocator, item);
                 },
             }

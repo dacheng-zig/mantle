@@ -82,6 +82,11 @@ pub const Db = struct {
     }
 
     pub fn deinit(self: *Db, gpa: std.mem.Allocator) void {
+        // Best-effort graceful COM_QUIT before dropping the socket. Without it
+        // the server logs "Got an error reading communication packets"
+        // (ER 1158) on the abrupt disconnect. A broken/closed connection just
+        // falls through to the socket close.
+        self.conn.close(gpa) catch {};
         self.conn.deinit(gpa);
         self.zs.stream.close();
     }

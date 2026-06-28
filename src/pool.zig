@@ -552,6 +552,11 @@ pub const TcpDriver = struct {
         timeout: zio.Timeout = .none,
         /// connect(2) timeout.
         connect_timeout: zio.Timeout = .none,
+        /// TLS configuration. When set, connections request a `CLIENT_SSL`
+        /// upgrade (per `tls.mode`) and tunnel auth + commands over TLS. Null
+        /// keeps the connection plaintext. The trust store referenced by
+        /// `.system` verification must outlive the pool.
+        tls: ?mantle.tls.ClientConfig = null,
     };
 
     target: Target,
@@ -579,13 +584,27 @@ pub const TcpDriver = struct {
 
         const addr = try zio.net.IpAddress.parseIp4(self.target.host, self.target.port);
         const stream = try addr.connect(.{ .timeout = self.target.connect_timeout });
-        handle.zs = mantle.transport.ZioStream.init(stream, self.target.timeout);
-        errdefer handle.zs.stream.close();
+
+        // Arm the stream for TLS when configured, and align the phase's TLS mode
+        // with it so the SSLRequest is sent exactly when the socket can upgrade.
+        var options = self.target.options;
+        if (self.target.tls) |tls_config| {
+            options.tls = tls_config.mode;
+            handle.zs = mantle.transport.ZioStream.initTls(stream, self.target.timeout, .{
+                .io = tls_config.io,
+                .host = self.target.host,
+                .verification = tls_config.verification,
+            });
+        } else {
+            handle.zs = mantle.transport.ZioStream.init(stream, self.target.timeout);
+        }
+        errdefer handle.zs.close();
 
         handle.conn = mantle.Connection.init(.{
             .reader = handle.zs.reader(),
             .writer = handle.zs.writer(),
-        }, self.target.options);
+            .upgrade = handle.zs.upgradeHook(),
+        }, options);
         // A failed handshake captures the server's reason (e.g. "Access denied")
         // into `conn.last_error`, whose duped message must be released; `close`
         // is never reached on this path, so deinit the connection explicitly.
@@ -603,7 +622,7 @@ pub const TcpDriver = struct {
             handle.conn.close(allocator) catch {};
         }
         handle.conn.deinit(allocator);
-        handle.zs.stream.close();
+        handle.zs.close();
         allocator.destroy(handle);
     }
 

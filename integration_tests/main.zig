@@ -5,4 +5,5 @@ test {
     _ = @import("connection.zig");
     _ = @import("pool.zig");
     _ = @import("statement_cache.zig");
+    _ = @import("tls.zig");
 }

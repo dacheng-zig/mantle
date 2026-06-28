@@ -26,6 +26,7 @@ pub const default_statement_cache_capacity = @import("client/statement.zig").def
 pub const protocol = @import("protocol/protocol.zig");
 pub const transport = @import("transport.zig");
 pub const Transport = transport.Transport;
+pub const tls = @import("tls.zig");
 
 test {
     _ = Connection;
@@ -39,6 +40,7 @@ test {
     _ = protocol;
     _ = transport;
     _ = Transport;
+    _ = tls;
     _ = @import("result/row.zig");
     _ = @import("client/table.zig");
     _ = @import("client/transaction.zig");

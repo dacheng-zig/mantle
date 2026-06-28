@@ -217,3 +217,58 @@ test "handshake negotiates client flags from server capabilities" {
     try std.testing.expect(negotiation.client_plugin_name != null);
     try std.testing.expect(negotiation.database == null);
 }
+
+const SSLRequest = handshake_mod.SSLRequest;
+
+test "SSLRequest serializes the 32-byte capability prefix" {
+    var writer = protocol.PayloadWriter.init(std.testing.allocator);
+    defer writer.deinit();
+
+    try SSLRequest.write(&writer, .{
+        .client_flags = 0x1234_5678,
+        .max_packet_size = 0x0100_0000,
+        .character_set = 45,
+    });
+
+    const bytes = writer.bytes();
+    // 4 (flags) + 4 (max packet) + 1 (charset) + 23 (reserved) = 32.
+    try std.testing.expectEqual(@as(usize, 32), bytes.len);
+    try std.testing.expectEqualSlices(u8, &.{ 0x78, 0x56, 0x34, 0x12 }, bytes[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0x00, 0x01 }, bytes[4..8]);
+    try std.testing.expectEqual(@as(u8, 45), bytes[8]);
+    for (bytes[9..32]) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    // The SSLRequest prefix must byte-match the start of a HandshakeResponse41
+    // built with the same flags, since the server parses them identically.
+    var response = protocol.PayloadWriter.init(std.testing.allocator);
+    defer response.deinit();
+    try HandshakeResponse41.write(&response, .{
+        .client_flags = 0x1234_5678,
+        .max_packet_size = 0x0100_0000,
+        .character_set = 45,
+        .username = "root",
+        .auth_response = "",
+    });
+    try std.testing.expectEqualSlices(u8, bytes, response.bytes()[0..32]);
+}
+
+test "negotiate enables CLIENT_SSL only when requested and server supports it" {
+    // Server advertising CLIENT_SSL + client requesting TLS -> upgrade.
+    var with_ssl = try HandshakeV10.parse(&sample_handshake);
+    with_ssl.capability_flags |= protocol.capability.client_ssl;
+    const upgraded = negotiateClientFlags(.{ .database = null, .request_tls = true }, with_ssl);
+    try std.testing.expect(upgraded.use_ssl);
+    try std.testing.expect((upgraded.client_flags & protocol.capability.client_ssl) != 0);
+
+    // Same server, but the client did not request TLS -> stay plaintext.
+    const not_requested = negotiateClientFlags(.{ .database = null, .request_tls = false }, with_ssl);
+    try std.testing.expect(!not_requested.use_ssl);
+    try std.testing.expect((not_requested.client_flags & protocol.capability.client_ssl) == 0);
+
+    // Client wants TLS but the server does not advertise it -> no upgrade
+    // (the `.require` policy turns this into an error in the phase layer).
+    const no_server_ssl = try HandshakeV10.parse(&sample_handshake);
+    try std.testing.expect((no_server_ssl.capability_flags & protocol.capability.client_ssl) == 0);
+    const fallback = negotiateClientFlags(.{ .database = null, .request_tls = true }, no_server_ssl);
+    try std.testing.expect(!fallback.use_ssl);
+    try std.testing.expect((fallback.client_flags & protocol.capability.client_ssl) == 0);
+}

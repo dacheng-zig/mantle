@@ -11,6 +11,7 @@ independent executable and shares the connection and printing helpers in
 | 03 crud | `03_crud.zig` | Prepared-statement CRUD: parameterized `INSERT`/`SELECT`/`UPDATE`/`DELETE` |
 | 04 transaction | `04_transaction.zig` | Transactions: `commit`, `rollback`, partial rollback via `savepoint` |
 | 05 pool | `05_pool.zig` | Connection pool: lease/return, concurrent coroutines sharing a limited connection count |
+| 06 tls | `06_tls.zig` | TLS (`CLIENT_SSL`) upgrade: encrypted handshake, selectable certificate verification, cipher proof |
 
 ## Running
 
@@ -28,6 +29,18 @@ zig build example-query
 zig build example-crud
 zig build example-transaction
 zig build example-pool
+zig build example-tls
+```
+
+The TLS example runs with certificate verification disabled by default, so it
+works against a stock MySQL's auto-generated self-signed certificate. That is for
+local development only. The production path verifies against the OS trust store;
+select it (and the other policies) with `MANTLE_TLS_VERIFY`:
+
+```sh
+zig build example-tls                              # insecure (default, dev only)
+MANTLE_TLS_VERIFY=self-signed zig build example-tls
+MANTLE_TLS_VERIFY=system zig build example-tls     # production
 ```
 
 The zio runtime prints debug logs to stderr. To see only the example output,

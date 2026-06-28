@@ -52,7 +52,7 @@ test "text result parses row values and nulls" {
 }
 
 test "text result classifies row terminators and errors" {
-    try std.testing.expectEqual(ResultPacketTag.row, try ResultPacketTag.classify(&.{ 0x01, '1' }, 1));
-    try std.testing.expectEqual(ResultPacketTag.eof, try ResultPacketTag.classify(&.{ 0xfe, 0x00, 0x00, 0x02, 0x00 }, 1));
-    try std.testing.expectEqual(ResultPacketTag.err, try ResultPacketTag.classify(&.{ 0xff, 0x15, 0x04 }, 1));
+    try std.testing.expectEqual(ResultPacketTag.row, try ResultPacketTag.classify(&.{ 0x01, '1' }));
+    try std.testing.expectEqual(ResultPacketTag.eof, try ResultPacketTag.classify(&.{ 0xfe, 0x00, 0x00, 0x02, 0x00 }));
+    try std.testing.expectEqual(ResultPacketTag.err, try ResultPacketTag.classify(&.{ 0xff, 0x15, 0x04 }));
 }

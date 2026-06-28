@@ -35,9 +35,47 @@ pub const TestConn = struct {
         return self;
     }
 
+    /// Dial the server and complete the handshake over TLS (MySQL `CLIENT_SSL`
+    /// upgrade). `io` drives the TLS handshake; `verification` selects the trust
+    /// policy. Requires a coroutine context (see `runWithIo`).
+    pub fn connectTls(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        cfg: TestConfig,
+        verification: mantle.tls.Verification,
+    ) !*TestConn {
+        const self = try allocator.create(TestConn);
+        errdefer allocator.destroy(self);
+
+        const addr = try zio.net.IpAddress.parseIp4(cfg.host, cfg.port);
+        const stream = try addr.connect(.{});
+        self.zs = mantle.transport.ZioStream.initTls(stream, .none, .{
+            .io = io,
+            .host = cfg.host,
+            .verification = verification,
+        });
+        errdefer self.zs.close();
+
+        var opts = cfg.options();
+        opts.tls = .require;
+        self.conn = mantle.Connection.init(.{
+            .reader = self.zs.reader(),
+            .writer = self.zs.writer(),
+            .upgrade = self.zs.upgradeHook(),
+        }, opts);
+        errdefer self.conn.deinit(allocator);
+        try self.conn.finishHandshake(allocator);
+
+        return self;
+    }
+
     pub fn deinit(self: *TestConn, allocator: std.mem.Allocator) void {
+        // Graceful COM_QUIT first, mirroring the pool's teardown, so the server
+        // closes the session cleanly instead of logging ER 1158 ("Got an error
+        // reading communication packets") on an abrupt socket drop.
+        self.conn.close(allocator) catch {};
         self.conn.deinit(allocator);
-        self.zs.stream.close();
+        self.zs.close();
         allocator.destroy(self);
     }
 
@@ -71,6 +109,35 @@ pub fn run(comptime task: fn (std.mem.Allocator) anyerror!void) !void {
     var group: zio.Group = .init;
     defer group.cancel();
     try group.spawn(Wrapper.entry, .{&result});
+    try group.wait();
+    return result;
+}
+
+/// Like `run`, but also hands the task the runtime's `std.Io` — needed by tests
+/// that drive a TLS handshake (entropy, wall clock, CA bundle reads).
+pub fn runWithIo(comptime task: fn (std.mem.Allocator, std.Io) anyerror!void) !void {
+    const runtime = try zio.Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    const io = runtime.io();
+
+    const Wrapper = struct {
+        fn entry(task_io: std.Io, result: *anyerror!void) void {
+            result.* = task(std.testing.allocator, task_io) catch |err| {
+                // `SkipZigTest` is a normal outcome (e.g. a server config the
+                // std TLS client cannot handshake); surface it without the
+                // failure banner so it reads as a skip, not a fault.
+                if (err != error.SkipZigTest)
+                    std.debug.print("integration task failed: {s}\n", .{@errorName(err)});
+                result.* = err;
+                return;
+            };
+        }
+    };
+
+    var result: anyerror!void = {};
+    var group: zio.Group = .init;
+    defer group.cancel();
+    try group.spawn(Wrapper.entry, .{ io, &result });
     try group.wait();
     return result;
 }

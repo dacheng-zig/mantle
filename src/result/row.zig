@@ -254,6 +254,24 @@ pub fn RowResult(comptime proto: decode_adapter.Protocol) type {
             }
         }
 
+        /// Scan borrowed row `values` (e.g. held in a reused collector buffer,
+        /// not an owned `transport_row`) into `dest`, duplicating `[]const u8`
+        /// fields with `str_allocator`. Equivalent to `scanAllocResolved` but for
+        /// the owned-collection path that reuses one value buffer across rows. The
+        /// transient instance's `transport_row` is never read by the scan and is
+        /// never deinit'd — the buffer is owned by the caller's `RowScratch`.
+        pub fn scanBorrowedResolved(
+            comptime Dest: type,
+            dest: *Dest,
+            columns: []const protocol.text_result.ColumnDefinition41,
+            values: []?[]const u8,
+            indices: []const usize,
+            str_allocator: std.mem.Allocator,
+        ) !void {
+            var transient = Self{ .tag = .row, .transport_row = undefined, .values = values };
+            return transient.scanAllocResolved(dest, columns, indices, str_allocator);
+        }
+
         fn scanImpl(
             self: *Self,
             dest: anytype,

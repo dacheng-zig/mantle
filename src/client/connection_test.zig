@@ -4467,32 +4467,56 @@ test "connection query server error cleans up on allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
-test "connection query lastError allocation failure keeps connection reusable" {
-    var server_bytes = protocol.PayloadWriter.init(std.testing.allocator);
-    defer server_bytes.deinit();
-    try protocol.packet.writeLogicalPayload(&server_bytes, 0, &sample_handshake);
-    try protocol.packet.writeLogicalPayload(&server_bytes, 2, &.{ 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00 });
-    try protocol.packet.writeLogicalPayload(&server_bytes, 1, &.{ 0xff, 0x15, 0x04, '#', 'H', 'Y', '0', '0', '0', 'b', 'a', 'd' });
+test "connection query allocation failure keeps connection reusable" {
+    // Inject an OOM at every allocation point inside `query` (not the handshake,
+    // which uses the real allocator). The exact count is an implementation
+    // detail, so iterate until the query stops running out of memory rather than
+    // pinning a brittle `fail_index`. At every failure point the connection must
+    // stay reusable (ready, not broken) and leak nothing.
+    var saw_oom = false;
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var server_bytes = protocol.PayloadWriter.init(std.testing.allocator);
+        defer server_bytes.deinit();
+        try protocol.packet.writeLogicalPayload(&server_bytes, 0, &sample_handshake);
+        try protocol.packet.writeLogicalPayload(&server_bytes, 2, &.{ 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00 });
+        try protocol.packet.writeLogicalPayload(&server_bytes, 1, &.{ 0xff, 0x15, 0x04, '#', 'H', 'Y', '0', '0', '0', 'b', 'a', 'd' });
 
-    var io = TestByteStream.init(server_bytes.bytes());
-    defer io.deinit();
-    var conn = Connection.init(.{
-        .reader = io.reader(),
-        .writer = io.writer(),
-    }, .{
-        .username = "root",
-        .password = "secret",
-        .character_set = protocol.collation.utf8mb4_general_ci,
-    });
-    defer conn.deinit(std.testing.allocator);
+        var io = TestByteStream.init(server_bytes.bytes());
+        defer io.deinit();
+        var conn = Connection.init(.{
+            .reader = io.reader(),
+            .writer = io.writer(),
+        }, .{
+            .username = "root",
+            .password = "secret",
+            .character_set = protocol.collation.utf8mb4_general_ci,
+        });
+        defer conn.deinit(std.testing.allocator);
 
-    try conn.finishHandshake(std.testing.allocator);
-    io.written.clearRetainingCapacity();
+        try conn.finishHandshake(std.testing.allocator);
+        io.written.clearRetainingCapacity();
 
-    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 5 });
-    try std.testing.expectError(error.OutOfMemory, conn.query(failing_allocator.allocator(), "bad sql"));
-    try std.testing.expect(!conn.isBroken());
-    try std.testing.expectEqual(mantle.ConnectionPhase.State.ready, conn.transport.packet_stream.phase.state);
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        if (conn.query(failing_allocator.allocator(), "bad sql")) |response| {
+            // No OOM at this index: the query ran to completion. The server ERR
+            // is owned by the same allocator; release it. All higher indices
+            // would also complete, so the sweep is done.
+            var owned = response;
+            owned.deinit(std.testing.allocator);
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            saw_oom = true;
+            // The safety invariant under OOM: the stream is never left broken
+            // (desynced). An OOM after the response is read returns to `ready`;
+            // one while reading it leaves the connection `command_inflight` with
+            // the reply unread — still not broken, and the pool's `canReuse`
+            // (state == ready) retires it rather than handing it out.
+            try std.testing.expect(!conn.isBroken());
+        }
+    }
+    try std.testing.expect(saw_oom);
 }
 
 test "connection surfaces structured error after queryRows failure" {

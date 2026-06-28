@@ -303,11 +303,11 @@ test "connection phase drains result stream terminator back to ready" {
     _ = try phase.receiveCommandResponse(&.{0x01});
 
     const row = [_]u8{ 0x01, '1' };
-    try std.testing.expectEqual(ConnectionPhase.Action.none, try phase.receiveTextResultStreamPacket(&row, 1));
+    try std.testing.expectEqual(protocol.text_result.ResultPacketTag.row, try phase.receiveTextResultStreamPacket(&row));
     try std.testing.expectEqual(ConnectionPhase.State.result_streaming, phase.state);
 
     const eof = [_]u8{ 0xfe, 0x00, 0x00, 0x02, 0x00 };
-    try std.testing.expectEqual(ConnectionPhase.Action.none, try phase.receiveTextResultStreamPacket(&eof, 1));
+    try std.testing.expectEqual(protocol.text_result.ResultPacketTag.eof, try phase.receiveTextResultStreamPacket(&eof));
     try std.testing.expectEqual(ConnectionPhase.State.ready, phase.state);
 }
 
@@ -328,7 +328,7 @@ test "connection phase continues after text result terminator with more results"
     _ = try phase.receiveCommandResponse(&.{0x01});
 
     const eof_more = [_]u8{ 0xfe, 0x00, 0x00, 0x0a, 0x00 };
-    try std.testing.expectEqual(ConnectionPhase.Action.none, try phase.receiveTextResultStreamPacket(&eof_more, 1));
+    try std.testing.expectEqual(protocol.text_result.ResultPacketTag.eof, try phase.receiveTextResultStreamPacket(&eof_more));
     try std.testing.expectEqual(ConnectionPhase.State.command_inflight, phase.state);
 
     try std.testing.expectEqual(ConnectionPhase.Action.start_result_stream, try phase.receiveCommandResponse(&.{0x01}));
@@ -352,7 +352,7 @@ test "connection phase continues after binary result terminator with more result
     _ = try phase.receiveCommandResponse(&.{0x01});
 
     const eof_more = [_]u8{ 0xfe, 0x00, 0x00, 0x0a, 0x00 };
-    try std.testing.expectEqual(ConnectionPhase.Action.none, try phase.receiveBinaryResultStreamPacket(&eof_more));
+    try std.testing.expectEqual(protocol.text_result.ResultPacketTag.eof, try phase.receiveBinaryResultStreamPacket(&eof_more));
     try std.testing.expectEqual(ConnectionPhase.State.command_inflight, phase.state);
 
     try std.testing.expectEqual(ConnectionPhase.Action.start_result_stream, try phase.receiveCommandResponse(&.{0x01}));
@@ -376,4 +376,73 @@ test "connection phase rejects empty binary result stream packet" {
     _ = try phase.receiveCommandResponse(&.{0x01});
 
     try std.testing.expectError(protocol.types.Error.EndOfPayload, phase.receiveBinaryResultStreamPacket(""));
+}
+
+test "connection phase emits SSLRequest then resumes the handshake over TLS" {
+    var handshake = sample_handshake;
+    handshake[22] |= 0x08; // advertise CLIENT_SSL in capability_flags_1
+
+    var phase = ConnectionPhase.init(.{
+        .username = "root",
+        .password = "secret",
+        .character_set = protocol.collation.utf8mb4_general_ci,
+        .tls = .require,
+    });
+    var writer = protocol.PayloadWriter.init(std.testing.allocator);
+    defer writer.deinit();
+
+    const action = try phase.receiveInitialHandshake(&writer, &handshake);
+    try std.testing.expectEqual(ConnectionPhase.Action.send_ssl_request, action);
+    try std.testing.expectEqual(ConnectionPhase.State.awaiting_tls, phase.state);
+    // The SSLRequest is exactly the 32-byte prefix and carries CLIENT_SSL.
+    try std.testing.expectEqual(@as(usize, 32), writer.bytes().len);
+    const ssl_flags = std.mem.readInt(u32, writer.bytes()[0..4], .little);
+    try std.testing.expect((ssl_flags & protocol.capability.client_ssl) != 0);
+
+    // After the transport completes the (here simulated) TLS upgrade, the full
+    // HandshakeResponse41 is produced and the phase advances to authenticating.
+    var response = protocol.PayloadWriter.init(std.testing.allocator);
+    defer response.deinit();
+    const resumed = try phase.resumeAfterTlsUpgrade(&response);
+    try std.testing.expectEqual(ConnectionPhase.Action.send_handshake_response, resumed);
+    try std.testing.expectEqual(ConnectionPhase.State.authenticating, phase.state);
+    try std.testing.expect(response.bytes().len > 32); // username + auth + plugin
+    const resp_flags = std.mem.readInt(u32, response.bytes()[0..4], .little);
+    try std.testing.expect((resp_flags & protocol.capability.client_ssl) != 0);
+
+    // A normal OK over the encrypted channel completes authentication.
+    const ok_payload = [_]u8{ 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00 };
+    try std.testing.expectEqual(ConnectionPhase.Action.none, try phase.receiveAuthPacket(&response, &ok_payload));
+    try std.testing.expectEqual(ConnectionPhase.State.ready, phase.state);
+}
+
+test "connection phase fails when TLS is required but server lacks CLIENT_SSL" {
+    var phase = ConnectionPhase.init(.{
+        .username = "root",
+        .password = "secret",
+        .tls = .require,
+    });
+    var writer = protocol.PayloadWriter.init(std.testing.allocator);
+    defer writer.deinit();
+
+    try std.testing.expectError(
+        error.TlsNotSupportedByServer,
+        phase.receiveInitialHandshake(&writer, &sample_handshake),
+    );
+    try std.testing.expectEqual(ConnectionPhase.State.failed, phase.state);
+}
+
+test "connection phase prefers plaintext when server lacks CLIENT_SSL" {
+    var phase = ConnectionPhase.init(.{
+        .username = "root",
+        .password = "secret",
+        .tls = .prefer,
+    });
+    var writer = protocol.PayloadWriter.init(std.testing.allocator);
+    defer writer.deinit();
+
+    // `.prefer` falls back to a plaintext handshake response, not an SSLRequest.
+    const action = try phase.receiveInitialHandshake(&writer, &sample_handshake);
+    try std.testing.expectEqual(ConnectionPhase.Action.send_handshake_response, action);
+    try std.testing.expectEqual(ConnectionPhase.State.authenticating, phase.state);
 }

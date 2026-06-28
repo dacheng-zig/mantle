@@ -22,6 +22,20 @@ pub const AnyWriter = struct {
     }
 };
 
+/// Hook the transport invokes to upgrade the underlying byte stream to TLS,
+/// after the `SSLRequest` has been written. The context is the stream
+/// implementation (e.g. a `*ZioStream`); the upgrade is done in place so the
+/// `AnyReader`/`AnyWriter` keep pointing at the same context — only their
+/// behaviour switches to encrypted I/O. Absent (`null`) on plaintext transports.
+pub const TlsUpgrade = struct {
+    context: *anyopaque,
+    upgradeFn: *const fn (context: *anyopaque, allocator: std.mem.Allocator) anyerror!void,
+
+    pub fn perform(self: TlsUpgrade, allocator: std.mem.Allocator) !void {
+        return self.upgradeFn(self.context, allocator);
+    }
+};
+
 /// Structured summary of a server OK packet. Carries no owned memory.
 pub const OkSummary = struct {
     affected_rows: u64,
@@ -115,18 +129,36 @@ pub const ResultRow = struct {
     }
 };
 
-pub const BinaryResultRow = struct {
-    tag: ResultRowTag,
-    payload: []u8,
-    values: []?[]const u8,
-    owns_values: bool,
-    server_error: ?ServerError = null,
+/// The text and binary protocols decode rows into identical owned shapes (an
+/// owned payload, value slices aliasing it, an optional owned server error), so
+/// the binary row type is an alias rather than a duplicate struct. `row.zig`
+/// keeps the per-protocol name for readability via the `proto` switch.
+pub const BinaryResultRow = ResultRow;
 
-    pub fn deinit(self: *BinaryResultRow, allocator: std.mem.Allocator) void {
-        if (self.server_error) |*err| err.deinit(allocator);
-        if (self.owns_values) allocator.free(self.values);
-        allocator.free(self.payload);
+/// Reusable scratch for collecting a whole result set without per-row
+/// allocation: one growable payload buffer and one value-slice buffer, both
+/// reused across rows via `readTextRowReusing` / `readBinaryRowReusing`. After
+/// the first row the buffers stay sized, so subsequent rows allocate nothing.
+/// Used by the owned collectors (`Connection.queryAll`/`queryAllParams`), which
+/// copy each row into an arena before reading the next.
+pub const RowScratch = struct {
+    payload: std.ArrayList(u8) = .empty,
+    values: std.ArrayList(?[]const u8) = .empty,
+
+    pub fn deinit(self: *RowScratch, allocator: std.mem.Allocator) void {
+        self.payload.deinit(allocator);
+        self.values.deinit(allocator);
     }
+};
+
+/// A result row read into a `RowScratch`. For a `.row`, `values` alias the
+/// scratch payload and are valid only until the next read into the same
+/// scratch — scan them into owned storage first. The `.err` variant owns
+/// `server_error`; the caller must capture or deinit it.
+pub const RowView = struct {
+    tag: ResultRowTag,
+    values: []?[]const u8,
+    server_error: ?ServerError = null,
 };
 
 pub const Transport = struct {
@@ -140,6 +172,11 @@ pub const Transport = struct {
     pub const Io = struct {
         reader: AnyReader,
         writer: AnyWriter,
+        /// Optional TLS upgrade hook. Set on transports that can switch to TLS
+        /// mid-handshake (see `ZioStream.upgradeHook`); null on plaintext-only
+        /// transports. `receiveNext` invokes it when the phase emits an
+        /// `SSLRequest`.
+        upgrade: ?TlsUpgrade = null,
     };
 
     pub fn init(io: Io, options: mantle.ConnectionPhase.Options) Transport {
@@ -180,6 +217,24 @@ pub const Transport = struct {
 
         if (self.packet_stream.phase.state == .failed and isErrorPayload(logical_payload.payload)) {
             self.captureHandshakeError(allocator, prev_state, logical_payload.payload);
+        }
+
+        // The SSLRequest has now reached the wire; upgrade the socket to TLS and
+        // send the HandshakeResponse41 over the encrypted channel. Driving both
+        // here (rather than returning to the caller) keeps the upgrade invisible
+        // to `finishHandshake`, which only ever sees the resulting
+        // `send_handshake_response` and an `authenticating` phase.
+        if (action == .send_ssl_request) {
+            const upgrade = self.io.upgrade orelse return error.TlsNotConfigured;
+            try upgrade.perform(allocator);
+
+            var framed_response = protocol.PayloadWriter.init(allocator);
+            defer framed_response.deinit();
+            const resumed = try self.packet_stream.resumeAfterTlsUpgrade(allocator, &framed_response);
+            if (framed_response.bytes().len > 0) {
+                try self.io.writer.writeAll(framed_response.bytes());
+            }
+            return resumed;
         }
         return action;
     }
@@ -243,9 +298,10 @@ pub const Transport = struct {
         const payload = try self.readPayload(allocator);
         defer allocator.free(payload);
 
-        var framed_client = protocol.PayloadWriter.init(allocator);
-        defer framed_client.deinit();
-        const action = try self.packet_stream.receiveServerPayload(allocator, &framed_client, payload);
+        // A command response never produces a client reply, so advance the state
+        // machine directly instead of `receiveServerPayload` (which would build
+        // an always-empty reply writer).
+        const action = try self.packet_stream.receiveCommandResponse(payload);
         return switch (action) {
             // A terminal command response (OK or ERR) is classified by the
             // packet payload, not connection state: a server ERR leaves the
@@ -257,7 +313,9 @@ pub const Transport = struct {
                     try protocol.response.ErrorResponse.parse(payload, protocol.capability.client_protocol_41),
                 ) }
             else
-                .{ .ok = try okSummaryFromPayload(payload) },
+                // The phase already parsed this OK packet to transition state;
+                // reuse its captured summary instead of decoding it again.
+                .{ .ok = okSummaryFromPhase(self.packet_stream.phase.command_ok) },
             .start_result_stream => .result_set,
             .local_infile_request => error.LocalInfileDisabled,
             else => error.InvalidConnectionPhaseState,
@@ -289,10 +347,11 @@ pub const Transport = struct {
         const payload = try self.readPayload(allocator);
         errdefer allocator.free(payload);
 
-        const tag = try protocol.text_result.ResultPacketTag.classify(payload, self.packet_stream.result_column_count);
-        var framed_client = protocol.PayloadWriter.init(allocator);
-        defer framed_client.deinit();
-        _ = try self.packet_stream.receiveServerPayload(allocator, &framed_client, payload);
+        // Advance the result-streaming state machine and reuse its row
+        // classification. Driving the phase directly (instead of
+        // `receiveServerPayload`) avoids an always-empty reply writer, and
+        // reusing the returned tag avoids a second `classify` of the payload.
+        const tag = try self.packet_stream.phase.receiveTextResultStreamPacket(payload);
         return switch (tag) {
             .row => row: {
                 const parsed = try protocol.text_result.TextRow.parse(allocator, payload, self.packet_stream.result_column_count);
@@ -326,20 +385,13 @@ pub const Transport = struct {
         self: *Transport,
         allocator: std.mem.Allocator,
         columns: []const protocol.text_result.ColumnDefinition41,
-    ) !BinaryResultRow {
+    ) !ResultRow {
         const payload = try self.readPayload(allocator);
         errdefer allocator.free(payload);
 
-        if (payload.len == 0) return error.EndOfPayload;
-
-        const tag: ResultRowTag = switch (payload[0]) {
-            0xff => .err,
-            0xfe => .eof,
-            else => .row,
-        };
-        var framed_client = protocol.PayloadWriter.init(allocator);
-        defer framed_client.deinit();
-        _ = try self.packet_stream.receiveServerPayload(allocator, &framed_client, payload);
+        // Advance the state machine and reuse its row classification (see
+        // `readTextRow`): binary rows never produce a client response.
+        const tag = try self.packet_stream.phase.receiveBinaryResultStreamPacket(payload);
         return switch (tag) {
             .row => row: {
                 const parsed = try protocol.binary_result.BinaryRow.parse(allocator, payload, columns);
@@ -367,6 +419,60 @@ pub const Transport = struct {
                 ),
             },
         };
+    }
+
+    /// Read one text result row into `scratch`, reusing its buffers instead of
+    /// allocating a fresh payload and values slice per row. The returned `.row`
+    /// values alias `scratch` and are valid only until the next read into it;
+    /// the caller (an owned collector) copies them out before continuing. Mirror
+    /// of `readTextRow` for the bulk-collection path.
+    pub fn readTextRowReusing(self: *Transport, allocator: std.mem.Allocator, scratch: *RowScratch) !RowView {
+        const payload = try self.readPayloadInto(allocator, &scratch.payload);
+        const tag = try self.packet_stream.phase.receiveTextResultStreamPacket(payload);
+        switch (tag) {
+            .row => {
+                const column_count = self.packet_stream.result_column_count;
+                try scratch.values.resize(allocator, column_count);
+                try protocol.text_result.TextRow.fillValues(payload, scratch.values.items);
+                return .{ .tag = .row, .values = scratch.values.items };
+            },
+            .eof => return .{ .tag = .eof, .values = &.{} },
+            .err => return .{
+                .tag = .err,
+                .values = &.{},
+                .server_error = try ServerError.clone(
+                    allocator,
+                    try protocol.response.ErrorResponse.parse(payload, protocol.capability.client_protocol_41),
+                ),
+            },
+        }
+    }
+
+    /// Binary counterpart of `readTextRowReusing`.
+    pub fn readBinaryRowReusing(
+        self: *Transport,
+        allocator: std.mem.Allocator,
+        columns: []const protocol.text_result.ColumnDefinition41,
+        scratch: *RowScratch,
+    ) !RowView {
+        const payload = try self.readPayloadInto(allocator, &scratch.payload);
+        const tag = try self.packet_stream.phase.receiveBinaryResultStreamPacket(payload);
+        switch (tag) {
+            .row => {
+                try scratch.values.resize(allocator, columns.len);
+                try protocol.binary_result.BinaryRow.fillValues(payload, columns, scratch.values.items);
+                return .{ .tag = .row, .values = scratch.values.items };
+            },
+            .eof => return .{ .tag = .eof, .values = &.{} },
+            .err => return .{
+                .tag = .err,
+                .values = &.{},
+                .server_error = try ServerError.clone(
+                    allocator,
+                    try protocol.response.ErrorResponse.parse(payload, protocol.capability.client_protocol_41),
+                ),
+            },
+        }
     }
 
     pub fn readTextResultMetadata(
@@ -404,7 +510,7 @@ pub const Transport = struct {
 
         const eof_payload = try self.readPayload(allocator);
         defer allocator.free(eof_payload);
-        if (try protocol.text_result.ResultPacketTag.classify(eof_payload, column_count) != .eof) {
+        if (try protocol.text_result.ResultPacketTag.classify(eof_payload) != .eof) {
             return error.MalformedResultSetPacket;
         }
 
@@ -420,14 +526,27 @@ pub const Transport = struct {
         self.packet_stream.next_sequence_id = logical_payload.next_sequence_id;
         return logical_payload.payload;
     }
+
+    /// Read one logical payload into `buf`, reusing its capacity instead of
+    /// allocating a fresh slice (see `RowScratch`). Returns the borrowed bytes
+    /// (`buf.items`), valid until the next read into `buf`.
+    fn readPayloadInto(self: *Transport, allocator: std.mem.Allocator, buf: *std.ArrayList(u8)) ![]const u8 {
+        buf.clearRetainingCapacity();
+        self.packet_stream.next_sequence_id = try readLogicalPayloadInto(
+            self.io.reader,
+            self.packet_stream.next_sequence_id,
+            allocator,
+            buf,
+        );
+        return buf.items;
+    }
 };
 
 fn isErrorPayload(payload: []const u8) bool {
     return payload.len > 0 and payload[0] == 0xff;
 }
 
-fn okSummaryFromPayload(payload: []const u8) !OkSummary {
-    const ok = try protocol.response.OkResponse.parse(payload, protocol.capability.client_protocol_41);
+fn okSummaryFromPhase(ok: mantle.ConnectionPhase.CommandOk) OkSummary {
     return .{
         .affected_rows = ok.affected_rows,
         .last_insert_id = ok.last_insert_id,
@@ -436,9 +555,25 @@ fn okSummaryFromPayload(payload: []const u8) !OkSummary {
     };
 }
 
+// Vendored std TLS client, forked to answer MySQL's `CertificateRequest` with
+// an empty client certificate (std's own client cannot, so it can't handshake
+// any TLS-enabled MySQL). Same API surface as `std.crypto.tls.Client`.
+const TlsClient = @import("crypto/tls_client.zig");
+/// The std TLS client asserts its encrypted-side reader holds at least one
+/// max-size ciphertext record. Every record buffer is sized to it for safety.
+const tls_record_buf_len = TlsClient.min_buffer_len;
+
 pub const ZioStream = struct {
     stream: zio.net.Stream,
     timeout: zio.Timeout = .none,
+    /// TLS handshake parameters, set via `initTls`. When present, `upgradeTls`
+    /// (driven by the MySQL `SSLRequest`) can promote this stream to TLS. Null
+    /// on a plaintext-only stream.
+    tls_opts: ?TlsOptions = null,
+    /// The live TLS session, heap-pinned so the std TLS client's
+    /// `@fieldParentPtr`-recovered reader/writer and its buffer pointers stay
+    /// valid. Null until `upgradeTls` runs.
+    tls_state: ?*TlsState = null,
     /// Inbound read buffer. MySQL replies arrive as a burst of small framed
     /// packets (a point SELECT is ~6 logical packets, each read as a 4-byte
     /// header then a small body). Without buffering each `readExact` is a raw
@@ -454,6 +589,15 @@ pub const ZioStream = struct {
     /// row-set reply in a single refill; larger replies just refill again.
     const read_buffer_size = 16 * 1024;
 
+    /// Parameters for a deferred TLS upgrade. `io` drives the handshake's
+    /// entropy, wall clock, and CA bundle reads; `host` is the SNI / verified
+    /// host name; `verification` selects the trust policy.
+    pub const TlsOptions = struct {
+        io: std.Io,
+        host: []const u8,
+        verification: mantle.tls.Verification,
+    };
+
     pub fn init(stream: zio.net.Stream, timeout: zio.Timeout) ZioStream {
         return .{
             .stream = stream,
@@ -461,10 +605,22 @@ pub const ZioStream = struct {
         };
     }
 
+    /// Like `init`, but arms the stream for a MySQL `CLIENT_SSL` upgrade. The
+    /// stream starts plaintext (the initial handshake is unencrypted); once the
+    /// phase emits an `SSLRequest`, `upgradeTls` promotes it to TLS in place.
+    pub fn initTls(stream: zio.net.Stream, timeout: zio.Timeout, tls_opts: TlsOptions) ZioStream {
+        return .{
+            .stream = stream,
+            .timeout = timeout,
+            .tls_opts = tls_opts,
+        };
+    }
+
     pub fn transport(self: *ZioStream, options: mantle.ConnectionPhase.Options) Transport {
         return Transport.init(.{
             .reader = self.reader(),
             .writer = self.writer(),
+            .upgrade = self.upgradeHook(),
         }, options);
     }
 
@@ -482,8 +638,21 @@ pub const ZioStream = struct {
         };
     }
 
+    /// The TLS upgrade hook for the transport, or null when this stream was not
+    /// armed for TLS (`init` rather than `initTls`). The hook captures the
+    /// pinned `*ZioStream`, so callers must build it from the final address.
+    pub fn upgradeHook(self: *ZioStream) ?TlsUpgrade {
+        if (self.tls_opts == null) return null;
+        return .{ .context = self, .upgradeFn = upgradeThunk };
+    }
+
     fn read(context: *anyopaque, dest: []u8) anyerror!usize {
         const self: *ZioStream = @ptrCast(@alignCast(context));
+        if (self.tls_state) |state| {
+            // Decrypted-side read: fills `dest` from the TLS reader, returning a
+            // short count (0 at end of stream) — matching `readExact`'s contract.
+            return state.tls.reader.readSliceShort(dest);
+        }
         if (self.read_start == self.read_end) {
             // Buffer drained. For a request large enough to own the syscall,
             // read straight into it and skip the copy; otherwise refill once.
@@ -503,7 +672,121 @@ pub const ZioStream = struct {
 
     fn writeAll(context: *anyopaque, bytes: []const u8) anyerror!void {
         const self: *ZioStream = @ptrCast(@alignCast(context));
+        if (self.tls_state) |state| {
+            // Plaintext in → encrypt → push to socket. The std TLS writer's own
+            // flush only encrypts into the encrypted-side writer's buffer; that
+            // buffer must then be flushed to the wire, or the bytes never leave
+            // this process. MySQL is request/response with no separate flush, so
+            // every framed write must reach the wire here.
+            try state.tls.writer.writeAll(bytes);
+            try state.tls.writer.flush();
+            try state.tcp_writer.interface.flush();
+            return;
+        }
         return self.stream.writeAll(bytes, self.timeout);
+    }
+
+    /// Per-connection TLS session, heap-pinned: the std TLS client recovers
+    /// itself from its reader/writer via `@fieldParentPtr`, and the
+    /// encrypted-side zio reader/writer hold pointers into the record buffers
+    /// below, so none of this may move after `upgradeTls`.
+    const TlsState = struct {
+        allocator: std.mem.Allocator,
+        /// Encrypted-side zio reader/writer: the TLS record transport over the
+        /// socket.
+        tcp_reader: zio.net.Stream.Reader,
+        tcp_writer: zio.net.Stream.Writer,
+        tls: TlsClient,
+        // Record buffers (one max ciphertext record each):
+        //   enc_read    — ciphertext pulled from the socket
+        //   enc_write   — ciphertext pushed to the socket
+        //   dec_read    — decrypted plaintext the driver reads
+        //   clear_write — plaintext the driver writes before encryption
+        enc_read_buf: [tls_record_buf_len]u8 = undefined,
+        enc_write_buf: [tls_record_buf_len]u8 = undefined,
+        dec_read_buf: [tls_record_buf_len]u8 = undefined,
+        clear_write_buf: [tls_record_buf_len]u8 = undefined,
+    };
+
+    fn upgradeThunk(context: *anyopaque, allocator: std.mem.Allocator) anyerror!void {
+        const self: *ZioStream = @ptrCast(@alignCast(context));
+        return self.upgradeTls(allocator);
+    }
+
+    /// Promote the plaintext socket to TLS in place: build the encrypted-side
+    /// reader/writer, run the std TLS handshake (its socket I/O rides the zio
+    /// coroutine), and switch `read`/`writeAll` to the encrypted path. Called
+    /// once, right after the `SSLRequest` reaches the wire.
+    fn upgradeTls(self: *ZioStream, allocator: std.mem.Allocator) !void {
+        const opts = self.tls_opts orelse return error.TlsNotConfigured;
+        // The MySQL handshake is lock-step: the server sends only its initial
+        // handshake, then waits for the SSLRequest before any TLS bytes. So the
+        // plaintext read buffer must be fully drained here; leftover bytes would
+        // be plaintext the TLS layer can never see (a desync), so refuse.
+        if (self.read_start != self.read_end) return error.TlsUpgradeBufferedData;
+
+        const state = try allocator.create(TlsState);
+        errdefer allocator.destroy(state);
+        state.* = .{
+            .allocator = allocator,
+            .tcp_reader = undefined,
+            .tcp_writer = undefined,
+            .tls = undefined,
+        };
+        // Wire the encrypted-side reader/writer at their final pinned addresses.
+        state.tcp_reader = self.stream.reader(&state.enc_read_buf);
+        state.tcp_writer = self.stream.writer(&state.enc_write_buf);
+        // Bound the handshake's socket I/O by the per-connection timeout.
+        state.tcp_reader.setTimeout(self.timeout);
+        state.tcp_writer.setTimeout(self.timeout);
+
+        var entropy: [TlsClient.Options.entropy_len]u8 = undefined;
+        try std.Io.randomSecure(opts.io, &entropy);
+
+        const host: @FieldType(TlsClient.Options, "host") = switch (opts.verification) {
+            .insecure_no_verification => .no_verification,
+            .system, .self_signed => .{ .explicit = opts.host },
+        };
+        const ca: @FieldType(TlsClient.Options, "ca") = switch (opts.verification) {
+            .insecure_no_verification => .no_verification,
+            .self_signed => .self_signed,
+            .system => |store| .{ .bundle = .{
+                .gpa = allocator,
+                .io = opts.io,
+                .lock = &store.lock,
+                .bundle = &store.bundle,
+            } },
+        };
+
+        state.tls = try TlsClient.init(&state.tcp_reader.interface, &state.tcp_writer.interface, .{
+            .host = host,
+            .ca = ca,
+            .read_buffer = &state.dec_read_buf,
+            .write_buffer = &state.clear_write_buf,
+            .entropy = &entropy,
+            .realtime_now = std.Io.Timestamp.now(opts.io, .real),
+            // MySQL frames every packet by length, so a truncated stream is
+            // detected by the protocol layer. Many servers close without a TLS
+            // close_notify, so forward a bare EOF as end-of-stream rather than
+            // erroring (matching how mainstream MySQL clients behave over TLS).
+            .allow_truncation_attacks = true,
+        });
+        self.tls_state = state;
+    }
+
+    /// Close the stream: send a best-effort TLS close_notify (if upgraded),
+    /// close the socket, and free the pinned TLS state. Use instead of touching
+    /// `stream.close()` directly so a TLS session is torn down cleanly.
+    pub fn close(self: *ZioStream) void {
+        if (self.tls_state) |state| {
+            state.tls.end() catch {};
+            state.tcp_writer.interface.flush() catch {};
+            self.stream.close();
+            state.allocator.destroy(state);
+            self.tls_state = null;
+            return;
+        }
+        self.stream.close();
     }
 };
 
@@ -513,15 +796,27 @@ fn readLogicalPayload(
     first_sequence_id: u8,
 ) !LogicalPayload {
     var tracker = protocol.types.SequenceTracker.init(first_sequence_id);
+
+    var header_bytes: [4]u8 = undefined;
+    try readExact(reader, &header_bytes);
+    var header = try protocol.types.PacketHeader.decode(&header_bytes);
+    try tracker.expect(header.sequence_id);
+
+    if (header.payload_length < protocol.types.max_packet_payload_size) {
+        // Single-packet logical payload — the overwhelmingly common case. The
+        // header gives the exact size, so allocate it once and read straight in,
+        // skipping the ArrayList growth + shrink-to-fit on the hot path.
+        const payload = try allocator.alloc(u8, header.payload_length);
+        errdefer allocator.free(payload);
+        try readExact(reader, payload);
+        return .{ .payload = payload, .next_sequence_id = tracker.next };
+    }
+
+    // Payload >= 16 MiB: fragmented across packets, terminated by one shorter
+    // than the threshold. Accumulate into a growable buffer.
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-
     while (true) {
-        var header_bytes: [4]u8 = undefined;
-        try readExact(reader, &header_bytes);
-        const header = try protocol.types.PacketHeader.decode(&header_bytes);
-        try tracker.expect(header.sequence_id);
-
         const old_len = out.items.len;
         try out.resize(allocator, old_len + header.payload_length);
         try readExact(reader, out.items[old_len..]);
@@ -532,6 +827,10 @@ fn readLogicalPayload(
                 .next_sequence_id = tracker.next,
             };
         }
+
+        try readExact(reader, &header_bytes);
+        header = try protocol.types.PacketHeader.decode(&header_bytes);
+        try tracker.expect(header.sequence_id);
     }
 }
 
@@ -539,6 +838,32 @@ const LogicalPayload = struct {
     payload: []u8,
     next_sequence_id: u8,
 };
+
+/// Read one logical payload (possibly fragmented across packets) by appending
+/// into the caller-provided `out`, which it pre-clears via the caller and reuses
+/// across rows. Returns the next sequence id. Unlike `readLogicalPayload` it
+/// does not own/return a fresh slice — the reused buffer is the win on the
+/// result-set hot path (`RowScratch`).
+fn readLogicalPayloadInto(
+    reader: AnyReader,
+    first_sequence_id: u8,
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+) !u8 {
+    var tracker = protocol.types.SequenceTracker.init(first_sequence_id);
+    while (true) {
+        var header_bytes: [4]u8 = undefined;
+        try readExact(reader, &header_bytes);
+        const header = try protocol.types.PacketHeader.decode(&header_bytes);
+        try tracker.expect(header.sequence_id);
+
+        const old_len = out.items.len;
+        try out.resize(allocator, old_len + header.payload_length);
+        try readExact(reader, out.items[old_len..]);
+
+        if (header.payload_length < protocol.types.max_packet_payload_size) return tracker.next;
+    }
+}
 
 fn readExact(reader: AnyReader, dest: []u8) !void {
     var offset: usize = 0;
