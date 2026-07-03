@@ -314,3 +314,54 @@ test "background reaper retires idle connections past idle_timeout" {
         }
     }.task);
 }
+
+test "pool teardown stays clean after binding a typed-null optional" {
+    // Regression probe for "Invalid free at pool teardown after binding a
+    // NULL optional" (observed under smp_allocator in app use; the testing
+    // allocator turns any such invalid/double free into a test failure).
+    // Mirrors the app shape: pooled connection, statement cache, a typed
+    // `?u64` null bound alongside other params, then pool deinit.
+    try run(struct {
+        fn task(a: std.mem.Allocator) !void {
+            var pool = mantle.TcpPool.init(a, mantle.TcpDriver.init(poolTarget()), .{
+                .max_connections = 1,
+            });
+            defer pool.deinit();
+
+            var db = try mantle.PooledConnection.acquire(&pool);
+            defer db.release();
+
+            try db.conn.execSimple(a, "DROP DATABASE IF EXISTS mantle_it_null_opt");
+            try db.conn.execSimple(a, "CREATE DATABASE mantle_it_null_opt");
+            defer db.conn.execSimple(a, "DROP DATABASE mantle_it_null_opt") catch {};
+            try db.conn.execSimple(a,
+                \\CREATE TEMPORARY TABLE mantle_it_null_opt.t (
+                \\  secret_hash CHAR(64) NOT NULL,
+                \\  user_id     BIGINT UNSIGNED NOT NULL,
+                \\  expire_at   BIGINT UNSIGNED NULL,
+                \\  unique_key  VARBINARY(32)   NULL
+                \\)
+            );
+
+            const insert = "INSERT INTO mantle_it_null_opt.t (secret_hash, user_id, expire_at, unique_key) VALUES (?, ?, ?, ?)";
+            // Both optional shapes: integer (`?u64`) and slice (`?[]const u8`).
+            const no_key: ?[]const u8 = null;
+            const ok_null = try db.conn.exec(a, insert, .{ "a" ** 64, @as(u64, 7), @as(?u64, null), no_key });
+            try std.testing.expectEqual(@as(u64, 1), ok_null.affected_rows);
+            // Same cached statement, now with the optionals present.
+            const key: ?[]const u8 = "k" ** 32;
+            const ok_some = try db.conn.exec(a, insert, .{ "b" ** 64, @as(u64, 8), @as(?u64, 12345), key });
+            try std.testing.expectEqual(@as(u64, 1), ok_some.affected_rows);
+
+            var table = try db.conn.queryOne(
+                struct { cnt: u64, non_nulls: u64 },
+                a,
+                "SELECT COUNT(*) AS cnt, COUNT(expire_at) AS non_nulls FROM mantle_it_null_opt.t",
+            );
+            defer table.deinit();
+            const row = try table.one();
+            try std.testing.expectEqual(@as(u64, 2), row.cnt);
+            try std.testing.expectEqual(@as(u64, 1), row.non_nulls);
+        }
+    }.task);
+}

@@ -306,7 +306,11 @@ fn writeParamValue(
             }
             @compileError("unsupported prepared statement struct parameter type");
         },
-        .pointer, .array => try writer.writeLengthEncodedString(stringBytes(param)),
+        .pointer => try writer.writeLengthEncodedString(stringBytes(param)),
+        // A by-value array must be sliced in THIS frame: slicing it inside a
+        // helper returns a pointer into the helper's dead frame (the bytes
+        // then read as stack garbage — a silent data corruption).
+        .array => try writer.writeLengthEncodedString(&param),
         else => @compileError("unsupported prepared statement parameter type"),
     };
 }
@@ -404,7 +408,9 @@ fn stringBytes(param: anytype) []const u8 {
             .slice => param,
             else => @compileError("prepared statement string pointer must be one or slice"),
         },
-        .array => param[0..],
-        else => @compileError("prepared statement string parameter must be []const u8 or an array"),
+        // No `.array` case on purpose: slicing a by-value array parameter
+        // would dangle once this frame returns. Arrays are sliced at the
+        // call site (writeParamValue), where the value outlives the write.
+        else => @compileError("prepared statement string parameter must be a pointer to bytes"),
     };
 }

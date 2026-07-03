@@ -550,3 +550,95 @@ test "encode adapter supports optional null parameter" {
 
     try std.testing.expectEqualSlices(u8, w2.bytes(), w1.bytes());
 }
+
+test "execute request encodes by-value array parameters as strings" {
+    var writer = protocol.PayloadWriter.init(std.testing.allocator);
+    defer writer.deinit();
+
+    // Mirrors binding a fixed-size struct field (e.g. a 16-byte id):
+    // the tuple field is a by-value [N]u8, not a pointer or slice.
+    const id: struct { bytes: [3]u8 } = .{ .bytes = .{ 'b', 'o', 'b' } };
+    try ExecuteRequest.writeWithParams(&writer, 0x12345678, .{id.bytes});
+
+    try std.testing.expectEqualSlices(u8, &.{
+        0x17,
+        0x78,
+        0x56,
+        0x34,
+        0x12,
+        0x00,
+        0x01,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x01,
+        0xfd,
+        0x00,
+        0x03,
+        'b',
+        'o',
+        'b',
+    }, writer.bytes());
+}
+
+test "execute request encodes typed optional parameters (null and present)" {
+    // A typed `?u64` null — the shape a nullable column binding takes when
+    // the value comes from data (e.g. `expire_at: ?u64 = null`), as opposed
+    // to the untyped `null` literal covered above.
+    {
+        var writer = protocol.PayloadWriter.init(std.testing.allocator);
+        defer writer.deinit();
+
+        try ExecuteRequest.writeWithParams(&writer, 0x12345678, .{@as(?u64, null)});
+
+        try std.testing.expectEqualSlices(u8, &.{
+            0x17,
+            0x78,
+            0x56,
+            0x34,
+            0x12,
+            0x00,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0b00000001, // null bitmap: param 0 is NULL
+            0x01,
+            0x08, // longlong
+            0x80, // unsigned
+        }, writer.bytes());
+    }
+    // The same optional carrying a value must write the value bytes.
+    {
+        var writer = protocol.PayloadWriter.init(std.testing.allocator);
+        defer writer.deinit();
+
+        try ExecuteRequest.writeWithParams(&writer, 0x12345678, .{@as(?u64, 5)});
+
+        try std.testing.expectEqualSlices(u8, &.{
+            0x17,
+            0x78,
+            0x56,
+            0x34,
+            0x12,
+            0x00,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x00, // null bitmap: no NULLs
+            0x01,
+            0x08, // longlong
+            0x80, // unsigned
+            0x05,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        }, writer.bytes());
+    }
+}
